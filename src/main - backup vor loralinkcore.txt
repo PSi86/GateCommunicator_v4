@@ -1,0 +1,732 @@
+/*
+ * USB LoRa Communicator (RadioLib + U8g2, Port deiner V4-Version)
+ * - unveränderte State Machine (currentMode/requestMode)
+ * - TX nur aus IDLE, RX-Fenster mit Timeout
+ * - Serial-Layout identisch (6B MAC: 00 00 00 + Last3)
+ * - OLED jetzt über U8g2, "Bold" = Doppelt zeichnen
+ *
+ * Basis: psi_GateCommunicator_V4.txt (dein Code). 1:1 Logikport. 
+ */
+
+#include <Arduino.h>
+#include "lora_proto.h"
+
+extern "C" {
+  #include <esp_mac.h>
+}
+
+#include <SPI.h>
+#include <Wire.h>
+#include <RadioLib.h>     // SX1262
+#include <U8g2lib.h>
+
+/************ LoRa PHY (wie vorher) ************/
+#define RF_FREQUENCY_HZ             868000000UL
+#define TX_OUTPUT_POWER             14           // dBm
+#define LORA_BW_KHZ                 125.0        // 0 => 125 kHz -> 125.0 in RadioLib
+#define LORA_SF                     7            // SF7
+#define LORA_CR_DEN                 5            // 4/5 -> 5
+#define LORA_PREAMBLE               8
+#define LORA_SYNCWORD               0x12
+
+/************ App/Proto ************/
+#define IDENTIFY        1
+#define ESPNOW_GATE     20
+#define BASIC_IR_GATE   21
+#define CUSTOM_IR_GATE  22
+#define WIZMOTE_GATE    23
+#define WLED_CUSTOM     24
+#define GET_DEVICES     30
+#define SET_GROUP       31
+
+#define BAUDRATE        921600
+#define RX_WINDOW_MS    2900
+
+#define BUTTON_PIN      0   // User-Button (GPIO0)
+/************ Button Handling (Short/Long) ************/
+volatile bool btnFallingFlag = false;
+unsigned long pressStartMs = 0;
+bool longHandled = false;
+
+void IRAM_ATTR isr_button() { btnFallingFlag = true; }
+
+/************ Pins (aus platformio.ini via -D ...) ************/
+#ifndef PIN_VEXT
+  #error "Define PIN_VEXT in platformio.ini build_flags"
+#endif
+#ifndef LORA_CS
+  #error "Define LORA_CS in platformio.ini build_flags"
+#endif
+#ifndef LORA_DIO1
+  #error "Define LORA_DIO1 in platformio.ini build_flags"
+#endif
+#ifndef LORA_BUSY
+  #error "Define LORA_BUSY in platformio.ini build_flags"
+#endif
+#ifndef LORA_RST
+  #error "Define LORA_RST in platformio.ini build_flags"
+#endif
+#ifndef LORA_SCK
+  #error "Define LORA_SCK in platformio.ini build_flags"
+#endif
+#ifndef LORA_MISO
+  #error "Define LORA_MISO in platformio.ini build_flags"
+#endif
+#ifndef LORA_MOSI
+  #error "Define LORA_MOSI in platformio.ini build_flags"
+#endif
+#ifndef OLED_SDA
+  #error "Define OLED_SDA in platformio.ini build_flags"
+#endif
+#ifndef OLED_SCL
+  #error "Define OLED_SCL in platformio.ini build_flags"
+#endif
+#ifndef OLED_RST
+  #error "Define OLED_RST in platformio.ini build_flags"
+#endif
+
+/************ USB framing for Host <-> Device (gc_transport.py) ************/
+// Frame: [0x00][LEN][TYPE][DATA...]; LEN = len(TYPE+DATA)
+// Device->Host LoRa forward: TYPE = Header7.type (N2M), DATA = [Header7][Body][RSSI(LE16)][SNR(i8)]
+// Device->Host Events:
+static const uint8_t EV_ERROR            = 0xF0;
+static const uint8_t EV_RX_WINDOW_OPEN   = 0xF1; // DATA: window_ms (LE16)
+static const uint8_t EV_RX_WINDOW_CLOSED = 0xF2; // DATA: rx_count_delta (LE16)
+static const uint8_t EV_TX_DONE          = 0xF3; // DATA: last_len (u8)
+
+static inline void usb_send_frame(uint8_t type, const uint8_t* data, uint8_t len) {
+  uint8_t L = (uint8_t)(1 + len); // TYPE + DATA
+  Serial.write((uint8_t)0x00);
+  Serial.write(L);
+  Serial.write(type);
+  if (len) Serial.write(data, len);
+}
+
+static inline void usb_send_event_u8(uint8_t evType, uint8_t v) {
+  uint8_t d[1] = { v };
+  usb_send_frame(evType, d, 1);
+}
+static inline void usb_send_event_u16(uint8_t evType, uint16_t v) {
+  uint8_t d[2] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF) };
+  usb_send_frame(evType, d, 2);
+}
+
+/************ OLED (U8g2) ************/
+// SSD1306 64x32 (UNIVISION) Full buffer, HW I2C
+//SSD1306 64X32_NONAME: https://github.com/olikraus/u8g2/wiki/u8g2setupcpp#ssd1306-64x32_1f-1
+//Full Frame Buffer and Pin Definitions:
+U8G2_SSD1306_64X32_1F_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST);
+//U8G2_SSD1306_64X32_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST);
+//U8G2_SSD1306_64X32_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA);
+//U8G2_SSD1306_64X32_1F_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ OLED_RST, /* clock=*/ OLED_SCL, /* data=*/ OLED_SDA);
+
+static inline bool same3(const uint8_t a[3], const uint8_t b[3]) {
+  return a[0]==b[0] && a[1]==b[1] && a[2]==b[2];
+}
+static inline void last3_from_mac6(uint8_t out[3], const uint8_t mac6[6]) {
+  out[0]=mac6[3]; out[1]=mac6[4]; out[2]=mac6[5];
+}
+static inline void mac6_to_str(const uint8_t m[6], char out[18]) {
+  snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+/************ Modes (deine Namen) ************/
+enum Mode { RF_MODE_IDLE, RF_MODE_TX, RF_MODE_RX };
+Mode currentMode  = RF_MODE_IDLE;
+Mode requestMode  = RF_MODE_IDLE;
+
+unsigned long rxWindowEnd = 0;
+uint16_t txCount = 0;
+uint16_t rxCount = 0;
+uint8_t  lastTxLen = 0;
+uint16_t rxCountWindowStart = 0;
+
+/************ MAC ************/
+uint8_t myMac6[6]  = {0};
+uint8_t myLast3[3] = {0};
+
+/************ Serial Handling (dein Parser) ************/
+const byte maxBytes = 255;
+byte receivedBytes[maxBytes];
+byte numReceived = 0;
+bool newSerialData = false;
+
+// Robust serial frame receiver for framing: [0x00][LEN][TYPE][DATA...]
+// LEN = number of bytes following LEN (TYPE + DATA)
+const uint16_t FRAG_TIMEOUT_MS = 25;   // 10–30 ms sind praxisnah bei 921600 Baud
+
+void recvSerialBytes() {
+  static bool     recvInProgress = false;
+  static uint8_t  ndx            = 0;     // how many bytes stored in receivedBytes (incl. LEN)
+  static uint8_t  dataLen        = 0;     // LEN byte value (TYPE+DATA bytes expected)
+  static uint32_t lastByteAtMs   = 0;
+
+  // Timeout auch dann prüfen, wenn gerade keine Bytes anliegen:
+  if (recvInProgress && !newSerialData) {
+    uint32_t now = millis();
+    if ((uint32_t)(now - lastByteAtMs) > FRAG_TIMEOUT_MS && Serial.available() == 0) {
+      // Fragment verworfen (Timeout)
+      recvInProgress = false;
+      ndx = 0; dataLen = 0;
+      // optionales Telemetrie-/Log-Event:
+      // usb_send_event_u16(EV_ERROR, 3); // 3 = TIMEOUT
+    }
+  }
+
+  while (Serial.available() > 0 && !newSerialData) {
+    uint8_t rb = (uint8_t)Serial.read();
+    lastByteAtMs = millis();
+
+    // Noch kein Frame aktiv -> warte auf Header 0x00
+    if (!recvInProgress) {
+      if (rb == 0x00) {
+        recvInProgress = true;
+        ndx = 0;
+        dataLen = 0;
+      }
+      continue;  // alles andere ignorieren bis zum nächsten 0x00
+    }
+
+    // Wir sind in einem Frame:
+    if (ndx == 0) {
+      // Erstes Byte nach 0x00 ist LEN (TYPE+DATA)
+      dataLen = rb;
+      if (dataLen == 0 || dataLen > (maxBytes - 1)) {
+        // Ungültige Länge -> Frame verwerfen und auf nächsten Header warten
+        recvInProgress = false;
+        ndx = 0; dataLen = 0;
+        // usb_send_event_u16(EV_ERROR, 1); // 1 = LEN_INVALID
+        continue;
+      }
+      receivedBytes[ndx++] = dataLen;  // LEN in [0] ablegen; TYPE folgt als nächstes
+      continue;
+    }
+
+    // TYPE/DATA aufnehmen
+    if (ndx < maxBytes) {
+      receivedBytes[ndx++] = rb;
+    } else {
+      // Pufferüberlauf -> Frame verwerfen
+      recvInProgress = false;
+      ndx = 0; dataLen = 0;
+      // usb_send_event_u16(EV_ERROR, 2); // 2 = OVERRUN
+      continue;
+    }
+
+    // Abschluss: genau wenn LEN + 1 Bytes (inkl. LEN) gelesen wurden
+    if (ndx == (uint16_t)dataLen + 1) {
+      numReceived    = ndx;        // enthält LEN + TYPE + DATA
+      newSerialData  = true;       // signalisiert Main-Loop: Frame liegt in receivedBytes
+      recvInProgress = false;
+      ndx = 0; dataLen = 0;
+      // while-Bedingung bricht hier ab (wegen !newSerialData), damit ein Frame pro Loop verarbeitet wird
+    }
+  }
+}
+
+/************ OLED Helpers (U8g2) ************/
+static void drawStringBold(int16_t x, int16_t y, const char* s) {
+  u8g2.setFont(u8g2_font_9x15B_mf);  // fette Schrift
+  u8g2.drawStr(x, y, s);
+  u8g2.setFont(u8g2_font_9x15_mf);
+}
+
+bool showDebug = false;
+bool inhibitStatusDraw = false;
+
+void drawStatus() {
+  if (inhibitStatusDraw) return;
+  char lineTX[16], lineRX[16];
+  snprintf(lineTX, sizeof(lineTX), "TX:%u", txCount);
+  snprintf(lineRX, sizeof(lineRX), "RX:%u", rxCount);
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_9x15_mf);     // ~15px Zeilenhöhe -> 2 Zeilen passen in 32px
+
+  // y-Koordinaten sind Baselines
+  if (currentMode == RF_MODE_TX) {
+    drawStringBold(0, 14, lineTX);
+    u8g2.drawStr(0, 31, lineRX);
+  } else if (currentMode == RF_MODE_RX) {
+    u8g2.drawStr(0, 14, lineTX);
+    drawStringBold(0, 31, lineRX);
+  } else {
+    u8g2.drawStr(0, 14, lineTX);
+    u8g2.drawStr(0, 31, lineRX);
+  }
+  u8g2.sendBuffer();
+}
+
+// globals
+uint8_t  dispbuffer[32];
+uint8_t  dispLen = 0;
+
+// 7 Bytes pro Zeile -> 21 Zeichen ("FF FF FF FF FF FF FF")
+static const char HEXLUT[] = "0123456789ABCDEF";
+
+void drawDebug(const uint8_t* buf, uint8_t len) {
+  if (!showDebug) return;
+  inhibitStatusDraw = true;                   // falls du die Statusanzeige temporär unterdrücken willst
+  dispLen = (len > sizeof(dispbuffer)) ? sizeof(dispbuffer) : len;
+  memcpy(dispbuffer, buf, dispLen);
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_mf);
+
+  // Kopfzeile: Länge
+  char hdr[22];
+  snprintf(hdr, sizeof(hdr), "LAST %uB%s", dispLen, (len > dispLen ? "+" : ""));
+  //u8g2.drawStr(0, 10, hdr);
+
+  const uint8_t perLine = 4;                  // passt in die Breite (21 Zeichen)
+  char line[22];                               // max 21 chars + \0
+  uint8_t y = 10; //22
+
+  for (uint8_t i = 0; i < 3 && i * perLine < dispLen; ++i) {
+    const uint8_t start = i * perLine;
+    const uint8_t count = (dispLen - start > perLine) ? perLine : (dispLen - start);
+
+    char* p = line;
+    for (uint8_t j = 0; j < count; ++j) {
+      if (j) *p++ = ' ';
+      uint8_t b = dispbuffer[start + j];
+      *p++ = HEXLUT[b >> 4];
+      *p++ = HEXLUT[b & 0x0F];
+    }
+    *p = '\0';
+    u8g2.drawStr(0, y, line);
+    y += 10;                                   // Zeilenhöhe der 6x10-Schrift
+  }
+
+  // falls abgeschnitten: Ellipse unten rechts
+  if (dispLen < len) u8g2.drawStr(110, 32, "...");
+
+  u8g2.sendBuffer();
+
+  // Optional: nach kurzer Zeit Status wieder erlauben
+  // inhibitStatusDraw = false;  // oder in deinem Main-Loop nach Timeout zurücksetzen
+}
+
+
+/************ Pending Send (ein Slot, wie bei dir) ************/
+bool        hasPendingSend = false;
+uint8_t  pendingBuf[32];
+uint8_t  pendingLen = 0;
+
+/************ RadioLib: Modul + ISR-Flags ************/
+SX1262 radio = SX1262(new Module(
+  LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, 
+  SPI, SPISettings(8000000, MSBFIRST, SPI_MODE0)
+));
+
+volatile bool dio1Flag = false;
+
+#if ESP32
+  #define ISR_ATTR IRAM_ATTR
+#endif
+
+void ISR_ATTR onDio1ISR() { dio1Flag = true; }
+
+/************ Vorwärts-Deklarationen Callbacks (Kompat) ************/
+void OnTxDone(void);
+void OnTxTimeout(void);  // (nicht direkt aus RadioLib getriggert, but kept)
+void OnRxDone(uint8_t* payload, uint16_t size, int16_t rssi, int8_t snr);
+
+/************ Senden (nur aus IDLE) ************/
+void tryDoPendingSend() {
+  if (!hasPendingSend) return;
+  if (currentMode != RF_MODE_IDLE) return;
+
+  currentMode = RF_MODE_TX;
+  drawStatus();
+
+  int16_t st = radio.startTransmit(pendingBuf, pendingLen);
+  if (st == RADIOLIB_ERR_NONE) {
+    hasPendingSend = false;
+  } else {
+    currentMode = RF_MODE_IDLE;  // Retry später
+  }
+}
+
+
+/************ API: Sendeauftrag einplanen ************/
+inline void scheduleSend(const uint8_t* buf, uint8_t len) { 
+  lastTxLen = len;
+  memcpy(pendingBuf, buf, len);
+  pendingLen = len;
+  hasPendingSend = true;
+}
+
+
+/************ Host-Kommandos (1:1) ************/
+void handleCommand() {
+  if (!newSerialData) return;
+
+  const uint8_t payloadLen = receivedBytes[0];
+  if (payloadLen < 1) { newSerialData = false; return; }
+  const uint8_t first = receivedBytes[1];
+
+  // Legacy IDENTIFY (kept for port discovery)
+  if (payloadLen == 1 && first == IDENTIFY) {
+    char macstr[18];
+    mac6_to_str(myMac6, macstr);
+    Serial.print(F("GateCommunicator_v4"));
+    Serial.print(macstr);
+    newSerialData = false;
+    return;
+  }
+
+  // New framing: TYPE_FULL + recv3 + body...
+  if ((first & 0x80) == LoraProto::DIR_M2N && payloadLen >= 4) {
+    const uint8_t type_full = first;
+    const uint8_t recv3[3] = { receivedBytes[2], receivedBytes[3], receivedBytes[4] };
+    const uint8_t bodyLen = (uint8_t)(payloadLen - 4);
+    const uint8_t* body   = &receivedBytes[5];
+
+    uint8_t out[32]; uint8_t n = 0;
+
+    switch (LoraProto::type_base(type_full)) {
+      case LoraProto::OPC_DEVICES: {
+        if (bodyLen == sizeof(LoraProto::P_GetDevices)) {
+          LoraProto::P_GetDevices p{};
+          memcpy(&p, body, sizeof(p));
+          n = LoraProto::build(out, myLast3, recv3, type_full, p);
+          scheduleSend(out, n);
+          drawDebug(out, n);
+          requestMode = RF_MODE_RX; // expect IDENTIFY_REPLY
+        }
+      } break;
+
+      case LoraProto::OPC_SET_GROUP: {
+        if (bodyLen == sizeof(LoraProto::P_SetGroup)) {
+          LoraProto::P_SetGroup p{};
+          memcpy(&p, body, sizeof(p));
+          n = LoraProto::build(out, myLast3, recv3, type_full, p);
+          scheduleSend(out, n);
+          drawDebug(out, n);
+          requestMode = RF_MODE_RX; // expect ACK
+        }
+      } break;
+
+      case LoraProto::OPC_WLED_CONTROL: {
+        if (bodyLen == sizeof(LoraProto::P_WledControl)) {
+          LoraProto::P_WledControl p{};
+          memcpy(&p, body, sizeof(p));
+          n = LoraProto::build(out, myLast3, recv3, type_full, p);
+          scheduleSend(out, n);
+          drawDebug(out, n);
+          if (requestMode != RF_MODE_RX) requestMode = RF_MODE_IDLE; // no reply
+        }
+      } break;
+
+      case LoraProto::OPC_STATUS: {
+        if (bodyLen == sizeof(LoraProto::P_GetStatus)) {
+          LoraProto::P_GetStatus p{};
+          memcpy(&p, body, sizeof(p));
+          n = LoraProto::build(out, myLast3, recv3, type_full, p);
+          scheduleSend(out, n);
+          drawDebug(out, n);
+          requestMode = RF_MODE_RX; // expect STATUS_REPLY
+        }
+      } break;
+    }
+    newSerialData = false;
+    return;
+  }
+
+  // Fallback: ignore
+  newSerialData = false;
+}
+
+/************ RadioLib: „Callbacks“ über Flags auswerten ************/
+void serviceDio1Flag() {
+  if (!dio1Flag) return;
+  dio1Flag = false;
+
+  if (currentMode == RF_MODE_TX) {
+    // TX-Done aufräumen & State zurück
+    radio.finishTransmit();
+    OnTxDone();
+    return;
+  }
+
+  if (currentMode == RF_MODE_RX) {
+    // Paket lesen
+    size_t len = radio.getPacketLength();   // aktualisiert Modem-Status
+    if (len >= sizeof(LoraProto::Header7)) {
+      uint8_t pkt[32];
+      if (len > sizeof(pkt)) len = sizeof(pkt);
+      if (radio.readData(pkt, len) == RADIOLIB_ERR_NONE) {
+        int16_t rssi = (int16_t)radio.getRSSI(true);
+        int8_t  snr  = (int8_t)radio.getSNR();
+        OnRxDone(pkt, (uint16_t)len, rssi, snr);
+      }
+    }
+    if(rxWindowEnd > 0) {
+      // RX-Fenster offen: weiter empfangen
+      radio.startReceive();
+    }
+  }
+}
+
+/************ Deine Callbacks (unverändert inhaltlich) ************/
+void OnTxDone(void) {
+  currentMode = RF_MODE_IDLE;
+  txCount++;
+  drawStatus();
+}
+
+void OnTxTimeout(void) {
+  // RadioLib liefert keinen separaten Timeout-IRQ.
+  // Falls benötigt, könntest du Sendestart prüfen und einen Software-Timeout setzen.
+  currentMode = RF_MODE_IDLE;
+  drawStatus();
+}
+
+
+// Precomputed full type constants for switch-case (must be constant expressions)
+static constexpr uint8_t T_N2M_DEVICES = (LoraProto::DIR_N2M | LoraProto::OPC_DEVICES);
+static constexpr uint8_t T_N2M_STATUS  = (LoraProto::DIR_N2M | LoraProto::OPC_STATUS);
+static constexpr uint8_t T_N2M_ACK     = (LoraProto::DIR_N2M | LoraProto::OPC_ACK);
+
+
+static inline void usb_forward_lora(const uint8_t* pkt, uint8_t len, int16_t rssi, int8_t snr) {
+  if (len < sizeof(LoraProto::Header7)) return;
+  const uint8_t type = pkt[sizeof(LoraProto::Header7)-1]; // header.type
+  uint8_t tmp[35];
+  if (len > 32) len = 32;
+  memcpy(tmp, pkt, len);
+  uint16_t r = (uint16_t)rssi;
+  tmp[len+0] = (uint8_t)(r & 0xFF);
+  tmp[len+1] = (uint8_t)((r >> 8) & 0xFF);
+  tmp[len+2] = (uint8_t)snr;
+  usb_send_frame(type, tmp, (uint8_t)(len+3));
+}
+
+void OnRxDone(uint8_t* payload, uint16_t size, int16_t rssi, int8_t snr) {
+  using namespace LoraProto;
+  Header7 h;
+  if (!parseHeader(payload, (uint8_t)size, h)) return;
+
+  // an mich oder Broadcast?
+  auto same3 = [](const uint8_t a[3], const uint8_t b[3]) {
+    return a[0]==b[0] && a[1]==b[1] && a[2]==b[2];
+  };
+  if (!(LoraProto::isBroadcast3(h.receiver) || same3(h.receiver, myLast3))) return;
+
+  rxCount++;
+  const uint8_t bodyLen = (uint8_t)(size - sizeof(Header7));
+
+  switch (h.type) {
+    case T_N2M_DEVICES: { // IDENTIFY_REPLY
+      P_IdentifyReply pl{};
+      if (parseBody(payload, (uint8_t)size, pl)) {
+        // Debug/Serial-Ausgabe nach Bedarf
+        // z.B.: Sender-MAC (voll aus Payload), Firmware/Proto anzeigen:
+        // Serial.printf("IDENTIFY_REPLY: proto=%u.%u caps=%u group=%u mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+        //   pl.proto_ver_major, pl.proto_ver_minor, pl.caps, pl.groupId,
+        //   pl.mac6[0],pl.mac6[1],pl.mac6[2],pl.mac6[3],pl.mac6[4],pl.mac6[5]);
+      }
+    } break;
+
+    case T_N2M_STATUS: { // STATUS_REPLY
+      P_StatusReply pl{};
+      if (parseBody(payload, (uint8_t)size, pl)) {
+        // Serial.printf("STATUS_REPLY: fw=%u.%u.%u vbat=%umV rssi=%d snr=%d\r\n",
+        //  pl.fw_major, pl.fw_minor, pl.fw_patch, pl.vbat_mV, pl.rssi, pl.snr);
+      }
+    } break;
+
+    case T_N2M_ACK: {
+      P_Ack ack{};
+      if (parseBody(payload, (uint8_t)size, ack)) {
+        // Serial.printf("ACK: echo_op=0x%02X status=%u seq=%u\r\n", ack.echo_opcode7, ack.status, ack.seq);
+      }
+    } break;
+  }
+
+  // Forward to host over USB
+  usb_forward_lora(payload, (uint8_t)size, rssi, snr);
+
+  // ggf. RX-Window-Logik wie bisher…
+  if (rxWindowEnd == 0) {
+    currentMode = RF_MODE_IDLE;
+    drawStatus();
+  }
+}
+
+
+/************ Mode-Orchestrierung (wie bei dir) ************/
+void updateMode() {
+  // 1) RadioLib-"IRQs" abarbeiten
+  //serviceRadioLibFlags();
+  serviceDio1Flag();
+
+  // 2) RX-Timeout prüfen
+  if (currentMode == RF_MODE_RX && rxWindowEnd > 0 && millis() > rxWindowEnd) {
+    radio.standby();                 // RX aus
+    currentMode = RF_MODE_IDLE;
+    requestMode = RF_MODE_IDLE;      // du machst das beim Timeout -> behalten
+    uint16_t delta = (uint16_t)(rxCount - rxCountWindowStart);
+    usb_send_event_u16(EV_RX_WINDOW_CLOSED, delta);
+    rxWindowEnd = 0;
+    drawStatus();
+  }
+
+  // 3) TX hat Vorrang (nur in IDLE)
+  if (currentMode == RF_MODE_IDLE) {
+    tryDoPendingSend();
+    if (currentMode == RF_MODE_TX) return;
+  }
+
+  // 4) RX-Wunsch nur aus IDLE aktivieren
+  if (requestMode == RF_MODE_RX && currentMode == RF_MODE_IDLE) {
+    radio.startReceive();            // einmal beim Eintritt
+    currentMode  = RF_MODE_RX;
+    rxWindowEnd  = millis() + RX_WINDOW_MS;
+    rxCountWindowStart = rxCount;
+    usb_send_event_u16(EV_RX_WINDOW_OPEN, RX_WINDOW_MS);
+    drawStatus();
+  }
+}
+
+/************ LoRa Init (RadioLib) ************/
+void lora_init() {
+  // SPI-Pins initialisieren (mit CS als SS)
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+
+  // SX1262 initialisieren
+  int16_t st = radio.begin(
+    (float)RF_FREQUENCY_HZ/1e6,   // MHz
+    LORA_BW_KHZ,                  // 125.0
+    LORA_SF,                      // 7
+    LORA_CR_DEN,                  // 5 (4/5)
+    LORA_SYNCWORD,                // 0x12
+    TX_OUTPUT_POWER,              // dBm
+    LORA_PREAMBLE                // 8
+  );
+  
+  // *** Heltec V3: TCXO über DIO3 versorgen ***
+  // Viele Heltec-V3-Boards benötigen 1.7..1.8V - teste 1.8V zuerst:;
+  // Falls 1.8V nicht funktioniert, versuche 1.7:
+  
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.print(F("ERR begin=")); Serial.println(st);
+    // hier ggf. return; (lassen wir laufen, um Fehlersuche zu erleichtern)
+  }
+
+/*  Now done in radio.begin:
+  radio.setSpreadingFactor(LORA_SF);
+  radio.setBandwidth(LORA_BW_KHZ);
+  radio.setCodingRate(LORA_CR_DEN);
+  radio.setPreambleLength(LORA_PREAMBLE);
+  radio.setSyncWord(LORA_SYNCWORD);
+  radio.setOutputPower(TX_OUTPUT_POWER); 
+*/
+  
+  // DIO1 als IRQ für TxDone/RxDone
+  // individual callbacks registered below 
+  // radio.setDio1Action(onDio1ISR);
+
+  radio.setDio2AsRfSwitch(true);
+  //radio.setTCXO(1.8f);  // Heltec V3: 1.8V für TCXO
+  //radio.setTCXO(1.7f);  // Heltec V3: 1.7V für TCXO
+  //radio.setTCXO(1.6f);  // Heltec V3: 1.6V für TCXO; evtl. auch 1.5V testen
+
+  //radio.setRxBoostedGainMode(true); // Optional: RX leicht anheben
+
+  radio.setCRC(true);
+
+  // Non-blocking Callbacks
+  //radio.setPacketSentAction(onTxDoneISR);
+  //radio.setPacketReceivedAction(onRxDoneISR);
+  radio.setDio1Action(onDio1ISR);
+  
+  currentMode = RF_MODE_IDLE;
+  requestMode = RF_MODE_IDLE;
+}
+
+/************ Setup/Loop ************/
+void setup() {
+  Serial.begin(BAUDRATE);
+  delay(50);
+
+  // Vext einschalten
+  pinMode(PIN_VEXT, OUTPUT); // Vext Pin als Output
+  digitalWrite(PIN_VEXT, LOW);   // LOW => Vext ON
+  
+  // Button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(BUTTON_PIN, isr_button, FALLING);
+  delay(50);
+
+  // I2C OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+
+  // OLED sauber resetten (manche Busse hängen nach Reset)
+/*   pinMode(OLED_RST, OUTPUT);
+  digitalWrite(OLED_RST, 1);
+  delay(1);
+  digitalWrite(OLED_RST, 0);
+  delay(20);
+  digitalWrite(OLED_RST, 1);
+  delay(10); */
+
+  u8g2.begin();
+
+  // MAC lesen
+  esp_read_mac(myMac6, ESP_MAC_WIFI_STA);
+  last3_from_mac6(myLast3, myMac6);
+
+  // LoRa
+  lora_init();
+
+  // Startanzeige
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.drawStr(0, 12, "LoRa Init...");
+  u8g2.sendBuffer();
+  delay(150);
+  drawStatus();
+}
+
+void loop() {
+  recvSerialBytes();
+  handleCommand();
+  updateMode();
+    // Button: Falling erkannt?
+  if (btnFallingFlag) {
+    btnFallingFlag = false;
+    // Start der Messung – warten auf Loslassen in Polling
+    pressStartMs = millis();
+    longHandled = false;
+  }
+
+  // Loslassen erkennen & Dauer auswerten
+  if (pressStartMs != 0) {
+    bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+    unsigned long now = millis();
+
+    // Long-Press Fire (einmalig)
+    if (pressed && !longHandled && (now - pressStartMs) >= 1000) {
+      longHandled = true;
+      // Long: do something
+      showDebug = !showDebug;
+      if (!showDebug) {
+        inhibitStatusDraw = false;
+        drawStatus();
+      }
+    }
+    // Release → Short, falls kein Long
+    if (!pressed) {
+      if (!longHandled && (now - pressStartMs) >= 30) {
+        // LONG: CONTROL an lastRespondent
+        inhibitStatusDraw = false;
+        drawStatus();
+      }
+      pressStartMs = 0;
+      longHandled  = false;
+    }
+  }
+}
