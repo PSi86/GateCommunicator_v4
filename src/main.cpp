@@ -293,6 +293,100 @@ SX1262 radio = SX1262(new Module(
   SPI, SPISettings(8000000, MSBFIRST, SPI_MODE0)
 ));
 
+
+/************ SYNC (Master-side) ************/
+// Master keeps a "dumb" timebase derived from millis().
+// Auto-SYNC is suppressed after an ARMED CONTROL until the host triggers one SYNC.
+// SYNC frames are always broadcast and are queued without CAD/LBT and without jitter.
+
+static constexpr uint8_t  GC_FLAG_ARM_ON_SYNC = (1u << 1);   // must match Node/Usermod
+
+enum class SyncState : uint8_t {
+  AUTO_ALLOWED = 0,
+  WAIT_HOST_TRIGGER,   // after CONTROL(ARM), block auto sync until host triggers OPC_SYNC
+  HOST_SYNC_RETRY      // host requested OPC_SYNC but it couldn't be queued yet (tx busy) -> retry ASAP
+};
+
+static SyncState syncState = SyncState::AUTO_ALLOWED;
+static uint32_t      lastSyncQueuedMs = 0;   // when a sync was successfully queued (auto or host)
+static uint8_t       hostSyncBri = 128;      // brightness of last host-triggered (pending) sync
+
+// Queue a frame for immediate TX without CAD/LBT and without jitter.
+static bool ll_queueTxNoCad(LoraLink::Core& ll, const uint8_t* buf, uint8_t len) {
+  if (!buf || !len) return false;
+  if (ll.txPending) return false;
+
+  const bool prevLbt = ll.lbtEnable;
+  ll.lbtEnable = false;
+  const bool ok = LoraLink::scheduleSend(ll, buf, len, 0 /*no jitter*/);
+  ll.lbtEnable = prevLbt;
+  return ok;
+}
+
+// Build + queue a global SYNC frame (broadcast) using the current millis()-based timebase.
+static bool sendSync(LoraLink::Core& ll, uint8_t brightness) {
+  static const uint8_t BCAST3[3] = {0xFF, 0xFF, 0xFF};
+
+  const uint32_t t = millis();
+
+  LoraProto::P_Sync p{};
+  p.ts24_0 = (uint8_t)(t);
+  p.ts24_1 = (uint8_t)(t >> 8);
+  p.ts24_2 = (uint8_t)(t >> 16);
+  p.brightness = brightness;
+
+  uint8_t out[sizeof(LoraProto::Header7) + sizeof(LoraProto::P_Sync)];
+  const uint8_t type_full = LoraProto::make_type(LoraProto::DIR_M2N, LoraProto::OPC_SYNC);
+  const uint8_t n = LoraProto::build(out, ll.myLast3, BCAST3, type_full, p);
+
+  // no CAD/LBT, no jitter
+  return ll_queueTxNoCad(ll, out, n);
+}
+
+// Auto-SYNC should only be sent when nothing else is happening.
+static bool idleForAutoSync(const LoraLink::Core& ll) {
+  // USB work pending?
+  if (newSerialData) return false;
+  if (Serial.available() > 0) return false;
+
+  // Link busy?
+  if (ll.txPending) return false;
+
+  // Do not interfere with receive mode / rx windows
+  if (ll.rfMode != LoraLink::Mode::Idle) return false;
+  if (ll.reqRxKind != LoraLink::RxKind::None) return false;
+
+  return true;
+}
+
+static void sync_service(LoraLink::Core& ll) {
+  const uint32_t now = millis();
+
+  // 1) Host-triggered SYNC retry: send ASAP once TX becomes available.
+  if (syncState == SyncState::HOST_SYNC_RETRY) {
+    if (!ll.txPending) {
+      if (sendSync(ll, hostSyncBri)) {
+        lastSyncQueuedMs = now;
+        syncState = SyncState::AUTO_ALLOWED;
+      }
+    }
+    return; // never auto-sync while host sync is pending
+  }
+
+  // 2) After CONTROL(ARM): block auto-sync until host triggers one SYNC.
+  if (syncState == SyncState::WAIT_HOST_TRIGGER) {
+    return;
+  }
+
+  // 3) Auto-SYNC: only when idle and at most every 30s.
+  if (!idleForAutoSync(ll)) return;
+  if (lastSyncQueuedMs != 0 && (uint32_t)(now - lastSyncQueuedMs) < 30000UL) return;
+
+  if (sendSync(ll, hostSyncBri)) {
+    lastSyncQueuedMs = now;
+  }
+}
+
 /************ Host-Kommandos (1:1) ************/
 void handleCommand() {
   if (!newSerialData) return;
@@ -321,6 +415,7 @@ void handleCommand() {
     uint8_t out[32]; uint8_t n = 0;
 
     switch (LoraProto::type_base(type_full)) {
+
       case LoraProto::OPC_DEVICES: {
         if (bodyLen == sizeof(LoraProto::P_GetDevices)) {
           LoraProto::P_GetDevices p{};
@@ -348,6 +443,7 @@ void handleCommand() {
           n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
           LoraLink::scheduleSend(ll, out, n);
           drawDebug(out, n);
+
           if (LoraLink::isBroadcast3(recv3)) {
             // unbekannte Zahl von Empfängern -> längeres RX-Fenster
             LoraLink::requestRxTimed(ll, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
@@ -356,16 +452,6 @@ void handleCommand() {
             LoraLink::requestRxTimed(ll, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
           }
           //LoraLink::scheduleSendThenRxWindow(ll, out, n, RX_WINDOW_MS);
-        }
-      } break;
-
-      case LoraProto::OPC_CONTROL: {
-        if (bodyLen == sizeof(LoraProto::P_Control)) {
-          LoraProto::P_Control p{};
-          memcpy(&p, body, sizeof(p));
-          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
-          LoraLink::scheduleSend(ll, out, n);
-          drawDebug(out, n);
         }
       } break;
 
@@ -386,6 +472,55 @@ void handleCommand() {
           //LoraLink::scheduleSendThenRxWindow(ll, out, n, RX_WINDOW_MS);
         }
       } break;
+      
+      case LoraProto::OPC_CONTROL: {
+        if (bodyLen == sizeof(LoraProto::P_Control)) {
+          LoraProto::P_Control p{};
+          memcpy(&p, body, sizeof(p));
+
+          // remember brightness for auto-sync (host may choose to ignore it on the nodes)
+          hostSyncBri = p.brightness;
+
+          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
+          bool ok = LoraLink::scheduleSend(ll, out, n);
+          drawDebug(out, n);
+
+          // If this CONTROL arms a sync-start, block auto-sync until host triggers OPC_SYNC.
+          if (ok && (p.flags & GC_FLAG_ARM_ON_SYNC)) {
+            syncState = SyncState::WAIT_HOST_TRIGGER;
+          }
+        }
+      } break;
+
+      case LoraProto::OPC_CONFIG: {
+        if (bodyLen == sizeof(LoraProto::P_Config)) {
+          LoraProto::P_Config p{};
+          memcpy(&p, body, sizeof(p));
+          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
+          bool ok = LoraLink::scheduleSend(ll, out, n);
+          drawDebug(out, n);
+        }
+      } break;
+
+      case LoraProto::OPC_SYNC: {
+        // Host triggers a global SYNC NOW (broadcast). Body is fixed-size P_Sync (brightness is used).
+        if (bodyLen == sizeof(LoraProto::P_Sync)) {
+          LoraProto::P_Sync p{};
+          memcpy(&p, body, sizeof(p));
+
+          // brightness to use for this (possibly retried) host-triggered sync
+          hostSyncBri = p.brightness;
+
+          // Try to queue immediately (no CAD/LBT). If TX is busy, retry ASAP in sync_service().
+          if (sendSync(ll, hostSyncBri)) {
+            lastSyncQueuedMs = millis();
+            syncState = SyncState::AUTO_ALLOWED;   // host sync done -> auto sync allowed again (30s gate applies)
+          } else {
+            syncState = SyncState::HOST_SYNC_RETRY;
+          }
+        }
+      } break;
+
     }
     newSerialData = false;
     return;
@@ -541,6 +676,7 @@ void loop() {
   recvSerialBytes();
   handleCommand();
   LoraLink::service(ll, cb); // an erster stelle??
+  sync_service(ll);
   
   // Button: Falling erkannt?
   if (btnFallingFlag) {
