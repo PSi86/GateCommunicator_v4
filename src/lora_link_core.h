@@ -7,8 +7,8 @@
 //
 // How to use (short):
 //   1) Board code creates SX1262 radio with its own pins (Module(cs,dio1,rst,busy,spi)).
-//   2) Call LoraLink::beginCommon(radio, cfg) with your PHY config (freq, bw, sf, cr, ...).
-//      You can leave device-specific options unset: txPowerDbm/diO2RfSwitch/rxBoost have defaults.
+//   2) Call LoraLink::beginCommon(radio, cfg) with PHY config (freq, bw, sf, cr, ...).
+//      Optionally leave device-specific options unset: txPowerDbm/dio2RfSwitch/rxBoost have defaults.
 //   3) Keep one LoraLink::Core 'll' per device. Attach ISR once via LoraLink::attachDio1(radio, ll).
 //   4) Define callbacks (onRxPacket, onTxDone, ...).
 //   5) In loop(): LoraLink::service(ll, cb).
@@ -17,10 +17,10 @@
 //   7) For sending: schedule with LoraLink::scheduleSend(...) or scheduleSendWithBackoff(...).
 //
 // Notes:
-// - This file intentionally does NOT know your pinout. Keep Module() creation in each firmware.
+// - This file intentionally does NOT know the pinout. Keep Module() creation in each firmware.
 // - Works with RadioLib SX1262. Requires <RadioLib.h> and <Arduino.h>.
 // - Uses a single static ISR trampoline; ok because Master and Node are separate binaries.
-// - Keep packets <= 32 bytes here to be safe; adapt if your app needs more.
+// - Keep packets <= 32 bytes here to be safe.
 //
 // License: MIT
 #pragma once
@@ -84,7 +84,15 @@ enum class TxArbiter : uint8_t { None, CadNeeded, CadPending };
 
 // -------------------- Core state --------------------
 struct Core {
-  SX1262*   radio             = nullptr;
+  
+  #if defined(GATE_LORA_SX1262)
+    SX1262*   radio             = nullptr;
+  #elif defined(GATE_LORA_LLCC68)
+    LLCC68*   radio             = nullptr;
+  #else
+    #error "No LoRa radio module defined"
+  #endif
+  
   volatile bool dio1Flag      = false;
   volatile uint32_t irqFlags  = 0;
 
@@ -200,7 +208,14 @@ inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]
 }
 
 // -------------------- Radio initialization common code --------------------
+#if defined(GATE_LORA_SX1262)
 inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
+#elif defined(GATE_LORA_LLCC68)
+inline bool beginCommon(LLCC68& radio, Core& ll, const PhyCfg& cfg) {
+#else
+  #error "No LoRa radio module defined"
+#endif
+//inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
   const int8_t power = (cfg.txPowerDbm == INT8_MIN) ? 14 : cfg.txPowerDbm;
 
   int16_t st = radio.begin(cfg.freqMHz, cfg.bwKHz, cfg.sf, cfg.crDen,
@@ -225,9 +240,17 @@ inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
   return true;
 }
 
+#if defined(GATE_LORA_SX1262)
 inline void attachDio1(SX1262& radio, Core& ll) {
   radio.setDio1Action(onDio1ISR_trampoline);
 }
+#elif defined(GATE_LORA_LLCC68)
+inline void attachDio1(LLCC68& radio, Core& ll) {
+  radio.setDio1Action(onDio1ISR_trampoline);
+}
+#else
+#error "No LoRa radio module defined"
+#endif
 
 // Maximaler LBT-Backoff in Millisekunden basierend auf time-on-air für das längste Paket
 // (für 17-Byte-Paket ca. 51 ms bei SF7BW125CR45)
@@ -308,7 +331,7 @@ inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jit
     ll.txArb = TxArbiter::None;
   }
 
-  //ll.debug = 0;
+  ll.debug = 0;
   ll.txPending = true; // mark TX as pending
   return true;
 }
@@ -372,10 +395,10 @@ inline void service(Core& ll, const Callbacks& cb) {
           if (cb.onRxPacket) cb.onRxPacket(pkt, (uint8_t)len, ll.lastRssi, ll.lastSnr, cb.ctx);
         }
       }
-      // Rx fortsetzen ( timed wird unten ggf. beendet)
-      if (!ll.txPending && ll.rxKind != RxKind::None) {
-        ll.radio->startReceive(); // TODO: prüfen ob nötig
-      }
+      // Rx fortsetzen nicht nötig (nutze immer continuous RX)
+      /* if (!ll.txPending && ll.rxKind != RxKind::None) {
+        ll.radio->startReceive(); // nicht nötig, startReceive löst continuous RX aus
+      } */
     }
   }
   // (B) Wenn im Idle, dann gewünschten Modus prüfen und wechseln
@@ -522,7 +545,7 @@ inline void service(Core& ll, const Callbacks& cb) {
     }
 
     if (ll.changeMode) {
-      // komme von Idle: RX starten
+      // komme von Idle: Continous RX starten
       if(ll.radio->startReceive() != RADIOLIB_ERR_NONE) {
         // RX nicht gestartet
         return; // fehler, wird im nächsten durchgang erneut versucht
