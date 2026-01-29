@@ -225,8 +225,95 @@ inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]
   return isBroadcast3(receiver3) || same3(receiver3, myLast3);
 }
 
-// Forward declaration (stream helpers use scheduleSend).
-inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500);
+// -------------------- RX/TX mode helpers --------------------
+inline void setDefaultIdle(Core& ll) {
+  ll.defaultRxKind = RxKind::None;
+  ll.defaultRxMs   = 0;
+}
+inline void setDefaultRxContinuous(Core& ll) {
+  ll.defaultRxKind = RxKind::Continuous;
+  ll.defaultRxMs   = 0; // echt kontinuierlich
+  ll.reqRxKind = RxKind::Continuous;
+  ll.reqRxMs = 0;
+}
+inline void requestRxTimed(Core& ll, uint16_t windowMs, int8_t rxNumWanted = -1) {
+  ll.reqRxKind = RxKind::Timed;
+  ll.reqRxMs = windowMs;
+  ll.rxNumWanted = rxNumWanted;
+  ll.changeMode = true; // force window (re)open even if already in Timed RX
+}
+inline void requestRxContinuous(Core& ll) {
+  ll.reqRxKind = RxKind::Continuous;
+  ll.reqRxMs = 0;
+}
+inline void cancelRxRequest(Core& ll) {
+  ll.changeMode = true;
+  ll.rfMode = Mode::Idle;
+  ll.reqRxKind = RxKind::None;
+  ll.reqRxMs = 0;
+}
+
+// One-slot TX scheduling (returns false if slot busy or oversize).
+// with LBT enabled jitterMaxMs is overridden with 300ms -> do it based on ToA?!
+// without LBT and jitterMaxMs>50 the given jitterMaxMs is used to delay the TX
+// without LBT and jitterMaxMs=0 the TX is scheduled immediately
+inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500) {
+
+  if (ll.txPending || len == 0 || len > sizeof(ll.txBuf)) return false; // Check for pending TX or oversize
+  memcpy(ll.txBuf, buf, len);
+  ll.txLen = len;
+  ll.earliestTxAtMs = millis();
+  
+  uint16_t jitterMinMs = 50; // default min jitter
+
+  if (ll.lbtEnable) {
+    //jitterMaxMs = lbtBackoffMaxMs(ll);
+    jitterMaxMs = 300; // fixed max backoff for LBT
+    uint16_t randDelayMs = randMs(ll, jitterMinMs, jitterMaxMs);
+    //ll.debug = randDelayMs;
+    ll.earliestTxAtMs += randDelayMs;
+    ll.txArb = TxArbiter::CadNeeded;
+  } 
+  else {
+    if (jitterMaxMs == 0) {
+      ll.earliestTxAtMs += 0; // no delay
+    }
+    else if (jitterMaxMs > jitterMinMs) {
+      ll.earliestTxAtMs += randMs(ll, jitterMinMs, jitterMaxMs);
+    }
+    else {
+      ll.earliestTxAtMs += randMs(ll, jitterMinMs, 300); // at least some jitter
+    }
+    ll.txArb = TxArbiter::None;
+  }
+
+  ll.debug = 0;
+  ll.txPending = true; // mark TX as pending
+  return true;
+}
+
+inline bool scheduleSendThenRxWindow(Core& ll, const uint8_t* buf, uint8_t len, uint16_t rxMs) {
+  // TODO: so noch ok oder muss an LBT angepasst werden? Wird aktuell nicht genutzt.
+  if (!scheduleSend(ll, buf, len)) return false;
+  requestRxTimed(ll, rxMs);
+  return true;
+}
+
+// Small wrapper for building + scheduling a typed payload (using LoraProto).
+template<typename PayloadT>
+inline bool buildAndSchedule(Core& ll, const uint8_t my3[3], const uint8_t dst3[3],
+                             uint8_t fullType, const PayloadT& p) {
+  uint8_t out[sizeof(LoraProto::Header7) + sizeof(PayloadT)];
+  uint8_t n = LoraProto::build(out, my3, dst3, fullType, p);
+  return scheduleSend(ll, out, n);
+}
+
+inline bool buildEmptyAndSchedule(Core& ll, const uint8_t my3[3], const uint8_t dst3[3],
+                                  uint8_t fullType) {
+  uint8_t out[sizeof(LoraProto::Header7)];
+  uint8_t n = LoraProto::build_empty(out, my3, dst3, fullType);
+  return scheduleSend(ll, out, n);
+}
 
 // -------------------- Stream helpers --------------------
 enum class StreamStatus : uint8_t { StreamStart, StreamContinue, StreamEnd, Error };
@@ -400,96 +487,6 @@ inline uint16_t randMs(Core& ll, uint16_t minMs, uint16_t maxMs) {
                 ? ll.radio->random(lo, hiExclusive)      // PhysicalLayer::random
                 : (int32_t)::random((long)lo, (long)hiExclusive);
   return (uint16_t)r;
-}
-
-// -------------------- RX/TX mode helpers --------------------
-inline void setDefaultIdle(Core& ll) {
-  ll.defaultRxKind = RxKind::None;
-  ll.defaultRxMs   = 0;
-}
-inline void setDefaultRxContinuous(Core& ll) {
-  ll.defaultRxKind = RxKind::Continuous;
-  ll.defaultRxMs   = 0; // echt kontinuierlich
-  ll.reqRxKind = RxKind::Continuous; 
-  ll.reqRxMs = 0;
-}
-inline void requestRxTimed(Core& ll, uint16_t windowMs, int8_t rxNumWanted = -1) {
-  ll.reqRxKind = RxKind::Timed; 
-  ll.reqRxMs = windowMs;
-  ll.rxNumWanted = rxNumWanted;
-  ll.changeMode = true; // force window (re)open even if already in Timed RX
-}
-inline void requestRxContinuous(Core& ll) {
-  ll.reqRxKind = RxKind::Continuous; 
-  ll.reqRxMs = 0;
-}
-inline void cancelRxRequest(Core& ll) {
-  ll.changeMode = true;
-  ll.rfMode = Mode::Idle;
-  ll.reqRxKind = RxKind::None; 
-  ll.reqRxMs = 0;
-}
-
-// One-slot TX scheduling (returns false if slot busy or oversize).
-// with LBT enabled jitterMaxMs is overridden with 300ms -> do it based on ToA?!
-// without LBT and jitterMaxMs>50 the given jitterMaxMs is used to delay the TX
-// without LBT and jitterMaxMs=0 the TX is scheduled immediately
-inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500) {
-
-  if (ll.txPending || len == 0 || len > sizeof(ll.txBuf)) return false; // Check for pending TX or oversize
-  memcpy(ll.txBuf, buf, len);
-  ll.txLen = len;
-  ll.earliestTxAtMs = millis();
-  
-  uint16_t jitterMinMs = 50; // default min jitter
-
-  if (ll.lbtEnable) {
-    //jitterMaxMs = lbtBackoffMaxMs(ll);
-    jitterMaxMs = 300; // fixed max backoff for LBT
-    uint16_t randDelayMs = randMs(ll, jitterMinMs, jitterMaxMs);
-    //ll.debug = randDelayMs;
-    ll.earliestTxAtMs += randDelayMs;
-    ll.txArb = TxArbiter::CadNeeded;
-  } 
-  else {
-    if (jitterMaxMs == 0) {
-      ll.earliestTxAtMs += 0; // no delay
-    }
-    else if (jitterMaxMs > jitterMinMs) {
-      ll.earliestTxAtMs += randMs(ll, jitterMinMs, jitterMaxMs);
-    }
-    else {
-      ll.earliestTxAtMs += randMs(ll, jitterMinMs, 300); // at least some jitter
-    }
-    ll.txArb = TxArbiter::None;
-  }
-
-  ll.debug = 0;
-  ll.txPending = true; // mark TX as pending
-  return true;
-}
-
-inline bool scheduleSendThenRxWindow(Core& ll, const uint8_t* buf, uint8_t len, uint16_t rxMs) {
-  // TODO: so noch ok oder muss an LBT angepasst werden? Wird aktuell nicht genutzt.
-  if (!scheduleSend(ll, buf, len)) return false;
-  requestRxTimed(ll, rxMs);
-  return true;
-}
-
-// Small wrapper for building + scheduling a typed payload (using LoraProto).
-template<typename PayloadT>
-inline bool buildAndSchedule(Core& ll, const uint8_t my3[3], const uint8_t dst3[3],
-                             uint8_t fullType, const PayloadT& p) {
-  uint8_t out[sizeof(LoraProto::Header7) + sizeof(PayloadT)];
-  uint8_t n = LoraProto::build(out, my3, dst3, fullType, p);
-  return scheduleSend(ll, out, n);
-}
-
-inline bool buildEmptyAndSchedule(Core& ll, const uint8_t my3[3], const uint8_t dst3[3],
-                                  uint8_t fullType) {
-  uint8_t out[sizeof(LoraProto::Header7)];
-  uint8_t n = LoraProto::build_empty(out, my3, dst3, fullType);
-  return scheduleSend(ll, out, n);
 }
 
 // -------------------- The service pump (call in loop()) --------------------
