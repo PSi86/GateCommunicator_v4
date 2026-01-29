@@ -141,6 +141,20 @@ struct Core {
   uint8_t   streamOffset         = 0;
   uint8_t   streamLastPacketsLeft = 0;
 
+  // --- Stream TX state (max 16 packets * 8 bytes = 128 bytes) ---
+  bool      streamTxActive       = false;
+  bool      streamTxLastScheduled = false;
+  uint8_t   streamTxBuf[128]     = {0};
+  uint8_t   streamTxLen          = 0;
+  uint8_t   streamTxOffset       = 0;
+  uint8_t   streamTxTotalPackets = 0;
+  uint8_t   streamTxIndex        = 0;
+  uint16_t  streamTxRxMs         = 0;
+  int8_t    streamTxRxNumWanted  = -1;
+  uint8_t   streamTxDst3[3]      = {0};
+  uint8_t   streamTxSrc3[3]      = {0};
+  uint8_t   streamTxType         = 0;
+
   // --- LBT / Arbiter / ToA ---
   bool       lbtEnable   = true;                // im Setup setzen
   bool       lbtRxRelax  = true;              // LBT-Backoff (µs)
@@ -225,6 +239,55 @@ inline const uint8_t* streamBuffer(const Core& ll, uint8_t& len) {
 
 inline void clearStreamReady(Core& ll) {
   ll.streamReady = false;
+}
+
+inline bool scheduleStreamSend(Core& ll, const uint8_t* data, uint8_t len,
+                               const uint8_t src3[3], const uint8_t dst3[3],
+                               uint8_t fullType, uint16_t rxMs, int8_t rxNumWanted = 1) {
+  constexpr uint8_t kChunkLen = sizeof(LoraProto::P_Stream::data);
+  constexpr uint8_t kMaxLen = 16 * kChunkLen;
+  if (ll.streamTxActive || ll.txPending) return false;
+  if (!data || len == 0 || len > kMaxLen) return false;
+  if ((len % kChunkLen) != 0) return false;
+  const uint8_t totalPackets = static_cast<uint8_t>(len / kChunkLen);
+  if (totalPackets < 2 || totalPackets > 16) return false;
+
+  memcpy(ll.streamTxBuf, data, len);
+  ll.streamTxActive = true;
+  ll.streamTxLastScheduled = false;
+  ll.streamTxLen = len;
+  ll.streamTxOffset = 0;
+  ll.streamTxTotalPackets = totalPackets;
+  ll.streamTxIndex = 0;
+  ll.streamTxRxMs = rxMs;
+  ll.streamTxRxNumWanted = rxNumWanted;
+  ll.streamTxType = fullType;
+  memcpy(ll.streamTxDst3, dst3, sizeof(ll.streamTxDst3));
+  memcpy(ll.streamTxSrc3, src3, sizeof(ll.streamTxSrc3));
+  return true;
+}
+
+inline bool queueNextStreamPacket(Core& ll) {
+  constexpr uint8_t kChunkLen = sizeof(LoraProto::P_Stream::data);
+  if (!ll.streamTxActive || ll.txPending) return false;
+  if (ll.streamTxIndex >= ll.streamTxTotalPackets) return false;
+
+  const bool isStart = (ll.streamTxIndex == 0);
+  const bool isStop = (ll.streamTxIndex == static_cast<uint8_t>(ll.streamTxTotalPackets - 1));
+  const uint8_t packetsLeft = static_cast<uint8_t>((ll.streamTxTotalPackets - 1) - ll.streamTxIndex);
+
+  LoraProto::P_Stream p{};
+  p.ctrl = LoraProto::encode_stream_ctrl(isStart, isStop, packetsLeft);
+  memcpy(p.data, &ll.streamTxBuf[ll.streamTxOffset], kChunkLen);
+
+  uint8_t out[sizeof(LoraProto::Header7) + sizeof(LoraProto::P_Stream)];
+  uint8_t n = LoraProto::build(out, ll.streamTxSrc3, ll.streamTxDst3, ll.streamTxType, p);
+  if (!scheduleSend(ll, out, n, 0)) return false;
+
+  ll.streamTxOffset += kChunkLen;
+  ++ll.streamTxIndex;
+  ll.streamTxLastScheduled = isStop;
+  return true;
 }
 
 inline StreamStatus handleStreamPacket(Core& ll, const LoraProto::P_Stream& pkt) {
@@ -467,6 +530,11 @@ inline void service(Core& ll, const Callbacks& cb) {
       } */
     }
   }
+
+  if (!ll.txPending && ll.streamTxActive) {
+    queueNextStreamPacket(ll);
+  }
+
   // (B) Wenn im Idle, dann gewünschten Modus prüfen und wechseln
   if(ll.rfMode == Mode::Idle) {
     // Idle → gewünschten Modus prüfen
@@ -557,6 +625,21 @@ inline void service(Core& ll, const Callbacks& cb) {
         //ll.debug = 100;
         if (cb.onTxDone) cb.onTxDone(cb.ctx);        
         
+        if (ll.streamTxLastScheduled) {
+          ll.streamTxActive = false;
+          ll.streamTxLastScheduled = false;
+          ll.streamTxLen = 0;
+          ll.streamTxOffset = 0;
+          ll.streamTxTotalPackets = 0;
+          ll.streamTxIndex = 0;
+          ll.streamTxType = 0;
+          if (ll.streamTxRxMs > 0) {
+            requestRxTimed(ll, ll.streamTxRxMs, ll.streamTxRxNumWanted);
+          }
+          ll.streamTxRxMs = 0;
+          ll.streamTxRxNumWanted = -1;
+        }
+
         ll.rfMode = Mode::Idle;
         ll.changeMode = true;
 

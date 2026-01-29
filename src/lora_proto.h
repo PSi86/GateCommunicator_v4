@@ -61,6 +61,11 @@ struct StreamCtrl {
   uint8_t packets_left;
 };
 
+inline uint8_t encode_stream_ctrl(bool start, bool stop, uint8_t packets_left) {
+  uint8_t ctrl = (start ? 0x80U : 0x00U) | (stop ? 0x40U : 0x00U);
+  return static_cast<uint8_t>(ctrl | (packets_left & 0x3FU));
+}
+
 inline StreamCtrl decode_stream_ctrl(uint8_t ctrl) {
   StreamCtrl decoded{};
   decoded.start = (ctrl & 0x80U) != 0U;
