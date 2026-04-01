@@ -1,11 +1,8 @@
 /*
- * USB LoRa Communicator (RadioLib + U8g2, Port deiner V4-Version)
- * - unveränderte State Machine (currentMode/requestMode)
+ * RaceLink USB Gateway v4
  * - TX nur aus IDLE, RX-Fenster mit Timeout
- * - Serial-Layout identisch (6B MAC: 00 00 00 + Last3)
+ * - Streaming (max 16 Pakete * 8 Bytes = 128 Bytes) mit Post-TX-RX-Fenster
  * - OLED jetzt über U8g2, "Bold" = Doppelt zeichnen
- *
- * Basis: psi_GateCommunicator_V4.txt (dein Code). 1:1 Logikport. 
  */
 
 #include <Arduino.h>
@@ -20,7 +17,7 @@ static LoraLink::Callbacks cb{};
 //#include <RadioLib.h>     // SX1262
 #include <U8g2lib.h>
 
-/************ LoRa PHY (wie vorher) ************/
+/************ LoRa PHY ************/
 #define RF_FREQUENCY_HZ             867700000UL //868000000UL
 #define TX_OUTPUT_POWER             14           // dBm
 #define LORA_BW_KHZ                 125.0        // 0 => 125 kHz -> 125.0 in RadioLib
@@ -29,21 +26,14 @@ static LoraLink::Callbacks cb{};
 #define LORA_PREAMBLE               8
 #define LORA_SYNCWORD               0x12
 
-/************ App/Proto ************/
-#define IDENTIFY        1
-#define ESPNOW_GATE     20
-#define BASIC_IR_GATE   21
-#define CUSTOM_IR_GATE  22
-#define WIZMOTE_GATE    23
-#define WLED_CUSTOM     24
-#define GET_DEVICES     30
-#define SET_GROUP       31
-
+/************ USB Link ************/
 #define BAUDRATE        921600
 
+/************ RX Wait times ************/
 #define RX_WINDOW_BROADCAST_MS  2000
 #define RX_WINDOW_UNICAST_MS    1000
 
+/************ Button Pin ************/
 #define BUTTON_PIN      0   // User-Button (GPIO0)
 
 /************ Button Handling (Short/Long) ************/
