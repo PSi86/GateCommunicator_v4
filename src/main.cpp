@@ -399,7 +399,7 @@ void handleCommand() {
   if (payloadLen == 1 && first == IDENTIFY) {
     char macstr[18];
     LoraLink::mac6ToStr(ll.myMac6, macstr);
-    Serial.print(F("GateCommunicator_v4"));
+    Serial.print(F("RaceLink_Gateway_v4"));
     Serial.print(macstr);
     newSerialData = false;
     return;
