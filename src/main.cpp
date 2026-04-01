@@ -530,19 +530,12 @@ void handleCommand() {
       } break;
 
       case LoraProto::OPC_STREAM: {
-        if (bodyLen == sizeof(LoraProto::P_Stream)) {
-          LoraProto::P_Stream p{};
-          memcpy(&p, body, sizeof(p));
-          n = LoraProto::build(out, ll.myLast3, recv3, type_full, p);
-          bool ok = LoraLink::scheduleSend(ll, out, n);
-          drawDebug(out, n);
-          if (ok) {
-            if (LoraLink::isBroadcast3(recv3)) {
-              LoraLink::requestRxTimed(ll, RX_WINDOW_BROADCAST_MS);
-            } else {
-              LoraLink::requestRxTimed(ll, RX_WINDOW_UNICAST_MS, 1);
-            }
-          }
+        if (bodyLen > 0) {
+          const bool isBroadcast = LoraLink::isBroadcast3(recv3);
+          const uint16_t rxWindowMs = isBroadcast ? RX_WINDOW_BROADCAST_MS : RX_WINDOW_UNICAST_MS;
+          const int8_t rxNumWanted = isBroadcast ? -1 : 1;
+          LoraLink::scheduleStreamSend(ll, body, bodyLen, ll.myLast3, recv3, type_full,
+                                       rxWindowMs, rxNumWanted);
         }
       } break;
 
