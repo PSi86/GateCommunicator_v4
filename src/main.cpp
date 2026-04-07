@@ -383,21 +383,21 @@ void handleCommand() {
 
   const uint8_t payloadLen = receivedBytes[0];
   if (payloadLen < 1) { newSerialData = false; return; }
-  const uint8_t first = receivedBytes[1];
+  const uint8_t firstByte = receivedBytes[1];
 
-  // Legacy IDENTIFY (kept for port discovery)
-  if (payloadLen == 1 && first == IDENTIFY) {
+  // IDENTIFY (for port discovery)
+  if (payloadLen == 1 && firstByte == 1) {
     char macstr[18];
     LoraLink::mac6ToStr(ll.myMac6, macstr);
-    Serial.print(F("RaceLink_Gateway_v4"));
+    Serial.print(F(DEV_TYPE_STR));
     Serial.print(macstr);
     newSerialData = false;
     return;
   }
 
   // New framing: TYPE_FULL + recv3 + body...
-  if ((first & 0x80) == LoraProto::DIR_M2N && payloadLen >= 4) {
-    const uint8_t type_full = first;
+  if ((firstByte & 0x80) == LoraProto::DIR_M2N && payloadLen >= 4) {
+    const uint8_t type_full = firstByte;
     const uint8_t recv3[3] = { receivedBytes[2], receivedBytes[3], receivedBytes[4] };
     const uint8_t bodyLen = (uint8_t)(payloadLen - 4);
     const uint8_t* body   = &receivedBytes[5];
