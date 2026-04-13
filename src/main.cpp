@@ -18,8 +18,8 @@ static RaceLinkTransport::Callbacks cb{};
 #include <U8g2lib.h>
 
 /************ LoRa PHY ************/
-#define RF_FREQUENCY_HZ             867700000UL //868000000UL
-#define TX_OUTPUT_POWER             14           // dBm
+#define RACELINK_FREQ_HZ             867700000UL //868000000UL
+#define RACELINK_TX_POWER             14           // dBm
 #define RACELINK_BW_KHZ                 125.0        // 0 => 125 kHz -> 125.0 in RadioLib
 #define RACELINK_SF                     7            // SF7
 #define RACELINK_CR_DEN                 5            // 4/5 -> 5
@@ -561,7 +561,7 @@ void transport_init() {
   SPI.begin(RACELINK_SCK, RACELINK_MISO, RACELINK_MOSI, RACELINK_CS);
 
   RaceLinkTransport::PhyCfg phy;
-  phy.freqMHz   = (float)RF_FREQUENCY_HZ / 1e6f;
+  phy.freqMHz   = (float)RACELINK_FREQ_HZ / 1e6f;
   phy.bwKHz     = RACELINK_BW_KHZ;
   phy.sf        = RACELINK_SF;
   phy.crDen     = RACELINK_CR_DEN;
@@ -570,7 +570,7 @@ void transport_init() {
   phy.crcOn     = true;
 
   // Gerätespezifische Overrides (wie bisher im Master):
-  phy.txPowerDbm   = TX_OUTPUT_POWER;     // z.B. 14
+  phy.txPowerDbm   = RACELINK_TX_POWER;     // z.B. 14
   phy.dio2RfSwitch = 1;                   // vorher: radio.setDio2AsRfSwitch(true);
   phy.rxBoost      = -1;                  // (lassen) oder 1/0 je nach Board
 
