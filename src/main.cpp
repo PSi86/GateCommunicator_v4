@@ -333,6 +333,23 @@ static bool sendSync(RaceLinkTransport::Core& rl, uint8_t brightness) {
   return rl_queueTxNoCad(rl, out, n);
 }
 
+static bool transportInDefaultIdleState(const RaceLinkTransport::Core& rl) {
+  if (rl.changeMode) return false;
+  if (rl.reqRxKind != rl.defaultRxKind) return false;
+  if (rl.reqRxMs != rl.defaultRxMs) return false;
+
+  switch (rl.defaultRxKind) {
+    case RaceLinkTransport::RxKind::None:
+      return rl.rfMode == RaceLinkTransport::Mode::Idle;
+    case RaceLinkTransport::RxKind::Continuous:
+      return rl.rfMode == RaceLinkTransport::Mode::Rx &&
+             rl.rxKind == RaceLinkTransport::RxKind::Continuous;
+    case RaceLinkTransport::RxKind::Timed:
+    default:
+      return false;
+  }
+}
+
 // Auto-SYNC should only be sent when nothing else is happening.
 static bool idleForAutoSync(const RaceLinkTransport::Core& rl) {
   // USB work pending?
@@ -341,12 +358,7 @@ static bool idleForAutoSync(const RaceLinkTransport::Core& rl) {
 
   // Link busy?
   if (rl.txPending) return false;
-
-  // Do not interfere with receive mode / rx windows
-  if (rl.rfMode != RaceLinkTransport::Mode::Idle) return false;
-  if (rl.reqRxKind != RaceLinkTransport::RxKind::None) return false;
-
-  return true;
+  return transportInDefaultIdleState(rl);
 }
 
 static void sync_service(RaceLinkTransport::Core& rl) {
@@ -406,6 +418,14 @@ void handleCommand() {
 
     switch (RaceLinkProto::type_base(type_full)) {
 
+      // Transport redesign (Plan Phase A): the dongle now stays in Continuous
+      // RX (setDefaultRxContinuous in transport_init()). We no longer request
+      // a Timed RX window after unicast/broadcast transmits -- the Core drops
+      // back to Continuous RX automatically after TX, and the Host owns the
+      // request-matching + timeout logic. This removes the double-clocking
+      // that caused "No ACK_OK ... (timeout)" warnings on the Host even when
+      // the node's ACK had been received and forwarded promptly.
+
       case RaceLinkProto::OPC_DEVICES: {
         if (bodyLen == sizeof(RaceLinkProto::P_GetDevices)) {
           RaceLinkProto::P_GetDevices p{};
@@ -413,16 +433,6 @@ void handleCommand() {
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
           RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
-          // decide on RX window depending on the sent frame being a broadcast or unicast
-          if (RaceLinkTransport::isBroadcast3(recv3)) {
-            // unbekannte Zahl von Empfängern -> längeres RX-Fenster
-            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
-          } else {
-            // unicast -> kürzeres RX-Fenster, nach nur einer Antwort RX beenden
-            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
-          }
-          //RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_MS); // z.B. 2900ms
-          //RaceLinkTransport::scheduleSendThenRxWindow(rl, out, n, RX_WINDOW_MS);
         }
       } break;
 
@@ -433,15 +443,6 @@ void handleCommand() {
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
           RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
-
-          if (RaceLinkTransport::isBroadcast3(recv3)) {
-            // unbekannte Zahl von Empfängern -> längeres RX-Fenster
-            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
-          } else {
-            // unicast -> kürzeres RX-Fenster, nach nur einer Antwort RX beenden
-            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
-          }
-          //RaceLinkTransport::scheduleSendThenRxWindow(rl, out, n, RX_WINDOW_MS);
         }
       } break;
 
@@ -452,17 +453,9 @@ void handleCommand() {
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
           RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
-          if (RaceLinkTransport::isBroadcast3(recv3)) {
-            // unbekannte Zahl von Empfängern -> längeres RX-Fenster
-            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_BROADCAST_MS); // z.B. 2900ms
-          } else {
-            // unicast -> kürzeres RX-Fenster, nach nur einer Antwort RX beenden
-            RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_UNICAST_MS, 1); // z.B. 1000ms
-          }
-          //RaceLinkTransport::scheduleSendThenRxWindow(rl, out, n, RX_WINDOW_MS);
         }
       } break;
-      
+
       case RaceLinkProto::OPC_CONTROL: {
         if (bodyLen == sizeof(RaceLinkProto::P_Control)) {
           RaceLinkProto::P_Control p{};
@@ -487,16 +480,8 @@ void handleCommand() {
           RaceLinkProto::P_Config p{};
           memcpy(&p, body, sizeof(p));
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
-          bool ok = RaceLinkTransport::scheduleSend(rl, out, n);
+          RaceLinkTransport::scheduleSend(rl, out, n);
           drawDebug(out, n);
-          if (ok) {
-            if (RaceLinkTransport::isBroadcast3(recv3)) {
-              // CONFIG should be unicast, but if broadcast, allow longer RX window
-              RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_BROADCAST_MS);
-            } else {
-              RaceLinkTransport::requestRxTimed(rl, RX_WINDOW_UNICAST_MS, 1);
-            }
-          }
         }
       } break;
 
@@ -585,7 +570,7 @@ void transport_init() {
   rl.lbtEnable = true;   // default: false
   
   RaceLinkTransport::attachDio1(radio, rl);
-  RaceLinkTransport::setDefaultIdle(rl);
+  RaceLinkTransport::setDefaultRxContinuous(rl);
 }
 
 // --- benannte Callbacks (Master) ---
