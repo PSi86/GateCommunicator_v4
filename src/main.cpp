@@ -81,19 +81,43 @@ void IRAM_ATTR isr_button() { btnFallingFlag = true; }
 /************ USB framing for Host <-> Device (gc_transport.py) ************/
 // Frame: [0x00][LEN][TYPE][DATA...]; LEN = len(TYPE+DATA)
 // Device->Host RaceLink transport forward: TYPE = Header7.type (N2M), DATA = [Header7][Body][RSSI(LE16)][SNR(i8)]
-// Device->Host Events:
-static const uint8_t EV_ERROR            = 0xF0;
-static const uint8_t EV_RX_WINDOW_OPEN   = 0xF1; // DATA: window_ms (LE16)
-static const uint8_t EV_RX_WINDOW_CLOSED = 0xF2; // DATA: rx_count_delta (LE16)
-static const uint8_t EV_TX_DONE          = 0xF3; // DATA: last_len (u8)
-static const uint8_t EV_IDLE             = 0xF4; // DATA: 1
+// Device->Host Events: see racelink_proto.h ("Gateway USB events + commands"):
+//   EV_ERROR (0xF0), EV_STATE_CHANGED (0xF1), EV_TX_DONE (0xF3),
+//   EV_TX_REJECTED (0xF4), EV_STATE_REPORT (0xF5).
+// Host->Device commands: GW_CMD_IDENTIFY (0x01), GW_CMD_STATE_REQUEST (0x7F).
 
 static inline void usb_send_frame(uint8_t type, const uint8_t* data, uint8_t len) {
-  uint8_t L = (uint8_t)(1 + len); // TYPE + DATA
-  Serial.write((uint8_t)0x00);
-  Serial.write(L);
-  Serial.write(type);
-  if (len) Serial.write(data, len);
+  // Coalesce the 4 logical writes (SOF, LEN, TYPE, DATA) into a single
+  // Serial.write call. Pre-coalesce each logical write was a separate
+  // call; on USB-CDC the host's bridge chip (CP210x / FTDI) sees them as
+  // distinct USB transactions and may stall up to its latency_timer
+  // (default 16 ms) waiting for "more data" before flushing each one.
+  // Single-buffer write keeps the whole frame in one USB packet so the
+  // host receives it in one read syscall — saves ~2-5 ms per event on
+  // the device → host path. Combined with the host-side
+  // set_low_latency_mode(True) and chunked _reader read this brings the
+  // per-packet wall-clock overhead from ~25 ms to <10 ms.
+  //
+  // Frame size is bounded: max event body in this gateway is ~32 bytes
+  // (a forwarded N2M packet with RSSI/SNR), so a 36-byte stack buffer is
+  // generous. The original per-byte writes had no size cap, but the
+  // current callers all stay well under this limit.
+  uint8_t buf[36];
+  if (len > sizeof(buf) - 3) {
+    // Defensive fallback for an oversized event (shouldn't happen with
+    // current callers): preserve the legacy per-write behaviour so the
+    // frame still goes out, just with the latency hit.
+    Serial.write((uint8_t)0x00);
+    Serial.write((uint8_t)(1 + len));
+    Serial.write(type);
+    if (len) Serial.write(data, len);
+    return;
+  }
+  buf[0] = 0x00;            // SOF
+  buf[1] = (uint8_t)(1 + len); // LEN = TYPE + DATA bytes
+  buf[2] = type;
+  if (len) memcpy(&buf[3], data, len);
+  Serial.write(buf, (size_t)(3 + len));
 }
 
 static inline void usb_send_event_u8(uint8_t evType, uint8_t v) {
@@ -103,6 +127,106 @@ static inline void usb_send_event_u8(uint8_t evType, uint8_t v) {
 static inline void usb_send_event_u16(uint8_t evType, uint16_t v) {
   uint8_t d[2] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF) };
   usb_send_frame(evType, d, 2);
+}
+static inline void usb_send_event_buf(uint8_t evType, const uint8_t* data, uint8_t len) {
+  usb_send_frame(evType, data, len);
+}
+
+// -------------------- Gateway state machine (Batch B, 2026-04-28) --------------------
+// The gateway is the single source of truth for its own state. setGatewayState()
+// emits one EV_STATE_CHANGED on every transition (deduplicates idempotent sets
+// so we don't spam the host on every continuous-RX re-entry that didn't actually
+// change the state byte). The host mirrors this 1:1 — no derived state machine.
+// EV_STATE_CHANGED body shape:
+//   * 1 byte  (state_byte) for IDLE / TX / RX / ERROR.
+//   * 3 bytes (state_byte, min_ms_LE16) for RX_WINDOW.
+
+static uint8_t  gw_currentState   = 0xFF; // sentinel "uninitialised" so the first set always emits
+static uint16_t gw_currentMetaU16 = 0;
+
+static inline void emit_state_event(uint8_t evType, uint8_t state_byte, uint16_t meta_u16, bool has_meta) {
+  if (has_meta) {
+    uint8_t d[3] = { state_byte, (uint8_t)(meta_u16 & 0xFF), (uint8_t)((meta_u16 >> 8) & 0xFF) };
+    usb_send_event_buf(evType, d, 3);
+  } else {
+    uint8_t d[1] = { state_byte };
+    usb_send_event_buf(evType, d, 1);
+  }
+}
+
+static inline void setGatewayState(uint8_t state_byte, uint16_t meta_u16 = 0, bool has_meta = false) {
+  if (state_byte == gw_currentState && meta_u16 == gw_currentMetaU16) {
+    return; // no-op; the host already has this exact state
+  }
+  gw_currentState   = state_byte;
+  gw_currentMetaU16 = meta_u16;
+  emit_state_event(RaceLinkProto::EV_STATE_CHANGED, state_byte, meta_u16, has_meta);
+}
+
+static inline void emit_state_report() {
+  // Reply to GW_CMD_STATE_REQUEST. Always emit even if state hasn't changed —
+  // this is a query-response, not a transition notification. RX_WINDOW carries
+  // its min_ms metadata; everything else is a 1-byte body.
+  bool has_meta = (gw_currentState == RaceLinkProto::GW_STATE_RX_WINDOW);
+  emit_state_event(RaceLinkProto::EV_STATE_REPORT, gw_currentState, gw_currentMetaU16, has_meta);
+}
+
+// NACK helper: emit EV_TX_REJECTED(type_full, reason) so the host can match
+// the rejection to the offending send. Reason codes are defined in
+// racelink_proto.h (TX_REJECT_TXPENDING / OVERSIZE / ZEROLEN / UNKNOWN).
+static inline void usb_send_tx_rejected(uint8_t type_full, uint8_t reason) {
+  uint8_t d[2] = { type_full, reason };
+  usb_send_event_buf(RaceLinkProto::EV_TX_REJECTED, d, 2);
+}
+
+// scheduleSend wrapper: pre-checks the same rejection conditions the core
+// uses (txPending, oversize, zerolen) and emits a typed NACK on rejection.
+// Returns true iff the frame was accepted into the single-slot scheduler.
+//
+// Why jitterMaxMs defaults to 0 here (Batch B follow-up, 2026-04-28):
+// The host's synchronous _send_m2n already serialises USB writes via
+// _tx_lock — only one frame is ever in flight at a time. There is no
+// burst-from-the-host scenario for which gateway-side pre-TX jitter
+// would help; it just adds latency.
+//
+// scheduleSend's own ``jitterMaxMs=2500`` parameter default is a footgun
+// for any caller that forgets to override it: when the gateway runs with
+// LBT off (its intentional master-side default — see transport_init()),
+// the call lands in randMs(50, 2500) and every host command waits a
+// random 50-2500 ms before the radio actually transmits. Empirically a
+// single small WLED preset send measured ~1097 ms wall-clock under that
+// default — well past the host's 2 s deadlock guard for an unlucky draw.
+//
+// When LBT is on the same scheduleSend silently overwrites jitterMaxMs
+// to 300 ms (transport_core.h line 318), which is why toggling LBT
+// "fixes" the symptom — the cap is hidden inside the LBT branch and has
+// nothing to do with CAD itself. Passing 0 here makes the wrapper opt
+// out of jitter entirely, so observed latency reduces to airtime + USB
+// regardless of the LBT setting.
+static inline bool try_schedule_or_nack(RaceLinkTransport::Core& rl,
+                                        const uint8_t* buf, uint8_t len,
+                                        uint8_t type_full,
+                                        uint16_t jitterMaxMs = 0) {
+  if (len == 0) {
+    usb_send_tx_rejected(type_full, RaceLinkProto::TX_REJECT_ZEROLEN);
+    return false;
+  }
+  if (len > sizeof(rl.txBuf)) {
+    usb_send_tx_rejected(type_full, RaceLinkProto::TX_REJECT_OVERSIZE);
+    return false;
+  }
+  if (rl.txPending) {
+    usb_send_tx_rejected(type_full, RaceLinkProto::TX_REJECT_TXPENDING);
+    return false;
+  }
+  bool ok = RaceLinkTransport::scheduleSend(rl, buf, len, jitterMaxMs);
+  if (!ok) {
+    // Defence in depth: pre-checks passed but the core still refused. The
+    // race window is narrow (no preemptive scheduling here) but the NACK
+    // keeps the host's outcome registry honest under all conditions.
+    usb_send_tx_rejected(type_full, RaceLinkProto::TX_REJECT_UNKNOWN);
+  }
+  return ok;
 }
 
 /************ OLED (U8g2) ************/
@@ -203,10 +327,18 @@ static void drawStringBold(int16_t x, int16_t y, const char* s) {
   u8g2.setFont(u8g2_font_9x15_mf);
 }
 
-bool showDebug = false;
-bool inhibitStatusDraw = false;
+// volatile: read by the Core-0 display task; written by the Core-1 button
+// handler (showDebug, inhibitStatusDraw) or drawDebugInternal itself
+// (inhibitStatusDraw). Single-byte aligned reads/writes are atomic on
+// ESP32; volatile keeps the compiler from caching them in registers
+// across the task loop body.
+volatile bool showDebug = false;
+volatile bool inhibitStatusDraw = false;
 
-void drawStatus() {
+// drawStatusInternal: must only be called from the display task on Core 0.
+// Use requestDisplayRedraw() from Core 1 (callbacks, loop, button handler)
+// to schedule a redraw via the FreeRTOS notification.
+void drawStatusInternal() {
   if (inhibitStatusDraw) return;
 
   char lineTX[16], lineRX[16];
@@ -230,39 +362,71 @@ void drawStatus() {
   u8g2.sendBuffer();
 }
 
-// globals
+// dispbuffer + dispLen are written by Core 1 inside requestDebugRedraw()
+// (under g_displayMux) and read by Core 0 inside drawDebugInternal()
+// (also under g_displayMux). The mux ensures the display task always
+// sees a consistent (length, bytes) pair even if a new RX packet
+// arrives mid-render.
 uint8_t  dispbuffer[32];
 uint8_t  dispLen = 0;
 
 // 7 Bytes pro Zeile -> 21 Zeichen ("FF FF FF FF FF FF FF")
 static const char HEXLUT[] = "0123456789ABCDEF";
 
-void drawDebug(const uint8_t* buf, uint8_t len) {
+// portMUX spinlock guarding dispbuffer/dispLen + the dirty flags. Defined
+// here (above drawDebugInternal which uses it) so we don't need a
+// forward declaration. The Core-0 display task globals (g_displayTask,
+// g_displayDirty, g_debugDirty, DISPLAY_MIN_INTERVAL_TICKS) live in the
+// same block right after this — they share the same lifetime + scope.
+static portMUX_TYPE  g_displayMux  = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t  g_displayTask = nullptr;
+static volatile bool g_displayDirty = false;
+static volatile bool g_debugDirty   = false;
+
+// 30 Hz rate cap for the display task. Notifications arriving inside the
+// window are coalesced; dirty flags are preserved so the next render
+// reflects the latest state.
+static const TickType_t DISPLAY_MIN_INTERVAL_TICKS = pdMS_TO_TICKS(33);
+
+// drawDebugInternal: must only be called from the display task on Core 0.
+// Reads the already-snapshotted dispbuffer / dispLen under g_displayMux.
+// Pre-offload this took a (buf, len) arg and copied inside; that copy now
+// happens in requestDebugRedraw() on the Core 1 caller side, so the
+// renderer is decoupled from the ephemeral RX-packet pointer lifetime.
+void drawDebugInternal() {
   if (!showDebug) return;
   inhibitStatusDraw = true;                   // falls du die Statusanzeige temporär unterdrücken willst
-  dispLen = (len > sizeof(dispbuffer)) ? sizeof(dispbuffer) : len;
-  memcpy(dispbuffer, buf, dispLen);
+
+  // Snapshot length + bytes into a stack-local copy under the mux so the
+  // I²C send doesn't hold the lock during the slow OLED transfer.
+  uint8_t local_len;
+  uint8_t local_buf[sizeof(dispbuffer)];
+  portENTER_CRITICAL(&g_displayMux);
+  local_len = dispLen;
+  if (local_len > sizeof(local_buf)) local_len = sizeof(local_buf);
+  memcpy(local_buf, dispbuffer, local_len);
+  portEXIT_CRITICAL(&g_displayMux);
 
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_mf);
 
-  // Kopfzeile: Länge
+  // Kopfzeile: Länge (currently disabled visually, kept for future)
   char hdr[22];
-  snprintf(hdr, sizeof(hdr), "LAST %uB%s", dispLen, (len > dispLen ? "+" : ""));
+  snprintf(hdr, sizeof(hdr), "LAST %uB", local_len);
   //u8g2.drawStr(0, 10, hdr);
 
   const uint8_t perLine = 4;                  // passt in die Breite (21 Zeichen)
   char line[22];                               // max 21 chars + \0
   uint8_t y = 10; //22
 
-  for (uint8_t i = 0; i < 3 && i * perLine < dispLen; ++i) {
+  for (uint8_t i = 0; i < 3 && i * perLine < local_len; ++i) {
     const uint8_t start = i * perLine;
-    const uint8_t count = (dispLen - start > perLine) ? perLine : (dispLen - start);
+    const uint8_t count = (local_len - start > perLine) ? perLine : (local_len - start);
 
     char* p = line;
     for (uint8_t j = 0; j < count; ++j) {
       if (j) *p++ = ' ';
-      uint8_t b = dispbuffer[start + j];
+      uint8_t b = local_buf[start + j];
       *p++ = HEXLUT[b >> 4];
       *p++ = HEXLUT[b & 0x0F];
     }
@@ -271,10 +435,91 @@ void drawDebug(const uint8_t* buf, uint8_t len) {
     y += 10;                                   // Zeilenhöhe der 6x10-Schrift
   }
 
-  // falls abgeschnitten: Ellipse unten rechts
-  if (dispLen < len) u8g2.drawStr(110, 32, "...");
-
   u8g2.sendBuffer();
+}
+
+// -------------------- Display task on Core 0 (PRO_CPU) --------------------
+// Pre-offload the OLED render ran in the Arduino loop on Core 1 and blocked
+// for ~7-10 ms per u8g2.sendBuffer() on the I²C bus. With drawStatus called
+// from the radio callbacks this directly delayed back-to-back host TX
+// processing by ~5 ms/pkt. The display now lives on Core 0; Core-1 callers
+// signal it via xTaskNotifyGive (sub-µs), and the task renders at most
+// every 33 ms (≈30 Hz cap).
+//
+// Single-task ownership rule (post-setup): u8g2 + Wire are not thread-safe.
+// After xTaskCreatePinnedToCore returns in setup(), Core 1 must NEVER touch
+// u8g2.* or Wire.* directly — only through requestDisplayRedraw() /
+// requestDebugRedraw().
+//
+// (g_displayTask, g_displayDirty, g_debugDirty, g_displayMux,
+//  DISPLAY_MIN_INTERVAL_TICKS are defined further up — right above
+//  drawDebugInternal, which uses g_displayMux. Defining them once there
+//  avoids a forward-declaration / redefinition conflict.)
+
+static void displayTaskFn(void*) {
+  TickType_t lastDrawTick = xTaskGetTickCount();
+
+  // First render so the operator sees the seeded IDLE status without
+  // waiting for the first state-change notification.
+  drawStatusInternal();
+  lastDrawTick = xTaskGetTickCount();
+
+  for (;;) {
+    // Block forever until a Core-1 caller signals via xTaskNotifyGive.
+    // pdTRUE clears the notification count to zero on receipt — the
+    // dirty flags carry the "what to draw" information.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    // Rate cap: ensure at least 33 ms elapsed since the last render.
+    // Notifications arriving during this delay are coalesced (binary
+    // semaphore semantic) and dirty flags are preserved, so the next
+    // render still reflects the latest state.
+    TickType_t now = xTaskGetTickCount();
+    TickType_t elapsed = now - lastDrawTick;
+    if (elapsed < DISPLAY_MIN_INTERVAL_TICKS) {
+      vTaskDelay(DISPLAY_MIN_INTERVAL_TICKS - elapsed);
+    }
+
+    bool needStatus, needDebug;
+    portENTER_CRITICAL(&g_displayMux);
+    needStatus = g_displayDirty; g_displayDirty = false;
+    needDebug  = g_debugDirty;   g_debugDirty   = false;
+    portEXIT_CRITICAL(&g_displayMux);
+
+    // Render order: debug first (sets inhibitStatusDraw = true so a
+    // pending status-redraw becomes a no-op until the user toggles
+    // showDebug off via the button). drawDebugInternal() bails out
+    // immediately when showDebug is false, so the call is cheap.
+    if (needDebug)  drawDebugInternal();
+    if (needStatus) drawStatusInternal();
+
+    lastDrawTick = xTaskGetTickCount();
+  }
+}
+
+// Core-1 callers schedule a status redraw. Sub-µs cost; never blocks.
+// Safe to call from any non-ISR Core-1 context (callbacks, loop, button
+// handler). Calling before the task is created (early in setup) is
+// silently dropped; the task's first render in setup() covers boot state.
+static inline void requestDisplayRedraw() {
+  portENTER_CRITICAL(&g_displayMux);
+  g_displayDirty = true;
+  portEXIT_CRITICAL(&g_displayMux);
+  if (g_displayTask) xTaskNotifyGive(g_displayTask);
+}
+
+// Core-1 callers schedule a debug-bytes redraw. Snapshots the byte
+// buffer into the shared dispbuffer under g_displayMux so the display
+// task always reads a consistent (length, bytes) pair even if a new
+// RX packet lands mid-render.
+static inline void requestDebugRedraw(const uint8_t* buf, uint8_t len) {
+  portENTER_CRITICAL(&g_displayMux);
+  uint8_t copyLen = (len > sizeof(dispbuffer)) ? sizeof(dispbuffer) : len;
+  memcpy(dispbuffer, buf, copyLen);
+  dispLen = copyLen;
+  g_debugDirty = true;
+  portEXIT_CRITICAL(&g_displayMux);
+  if (g_displayTask) xTaskNotifyGive(g_displayTask);
 }
 
 /************ RadioLib: Modul + ISR-Flags ************/
@@ -285,36 +530,83 @@ SX1262 radio = SX1262(new Module(
 
 
 /************ SYNC (Master-side) ************/
-// Master keeps a "dumb" timebase derived from millis().
-// Auto-SYNC is suppressed after an ARMED CONTROL until the host triggers one SYNC.
+// Master keeps a "dumb" timebase derived from millis() and broadcasts an
+// autosync every 30 s while idle so nodes can correct drift. Autosync
+// emits the legacy 4-byte SYNC body (no flags); arm-on-sync gating is
+// now handled device-side via SYNC_FLAG_TRIGGER_ARMED on the host's
+// deliberate-fire SYNC, so the gateway does NOT inhibit autosync
+// during armed windows any more. The idle gate (``idleForAutoSync``)
+// stays — autosync still mustn't preempt other in-flight TX work.
 // SYNC frames are always broadcast and are queued without CAD/LBT and without jitter.
 
 static constexpr uint8_t  GC_FLAG_ARM_ON_SYNC = (1u << 1);   // must match Node/Usermod
 
+// After the SYNC_FLAG_TRIGGER_ARMED protocol change, the gateway no
+// longer needs to inhibit autosync between an arm and the host's
+// trigger SYNC: nodes now only materialise pending arm-on-sync state
+// when the SYNC packet carries the trigger flag, and autosync
+// deliberately leaves it 0. ``WAIT_HOST_TRIGGER`` is therefore commented
+// out (rather than deleted) so the inhibit can be reintroduced quickly
+// if a future protocol regression demands it; ``HOST_SYNC_RETRY`` stays
+// — that's the unrelated retry path for when a host-initiated SYNC hits
+// a busy TX slot.
 enum class SyncState : uint8_t {
   AUTO_ALLOWED = 0,
-  WAIT_HOST_TRIGGER,   // after CONTROL(ARM), block auto sync until host triggers OPC_SYNC
+  // WAIT_HOST_TRIGGER, // disabled: arm-on-sync is now gated device-side via SYNC_FLAG_TRIGGER_ARMED
   HOST_SYNC_RETRY      // host requested OPC_SYNC but it couldn't be queued yet (tx busy) -> retry ASAP
 };
 
 static SyncState syncState = SyncState::AUTO_ALLOWED;
 static uint32_t      lastSyncQueuedMs = 0;   // when a sync was successfully queued (auto or host)
 static uint8_t       hostSyncBri = 128;      // brightness of last host-triggered (pending) sync
+// Captured SYNC_FLAG_* byte from the host's deliberate sync. The receive
+// handler stashes it here so a HOST_SYNC_RETRY re-emission still carries the
+// trigger bit; autosync paths leave it 0 (clock-tick only). Preserves the
+// SYNC_FLAG_TRIGGER_ARMED gate end-to-end so nodes only fire armed effects
+// on a deliberate-fire pulse.
+static uint8_t       hostSyncFlags = 0;
 
 // Queue a frame for immediate TX without CAD/LBT and without jitter.
-static bool rl_queueTxNoCad(RaceLinkTransport::Core& rl, const uint8_t* buf, uint8_t len) {
-  if (!buf || !len) return false;
-  if (rl.txPending) return false;
+// Used for SYNC pulses (auto + host-triggered). On rejection emits a typed
+// NACK so the host's pending-send outcome registry can fail the matching
+// _send_m2n call (or, for auto-sync, the host harmlessly drops the orphan
+// NACK because no outcome slot is registered).
+static bool rl_queueTxNoCad(RaceLinkTransport::Core& rl, const uint8_t* buf, uint8_t len, uint8_t type_full) {
+  if (!buf || !len) {
+    usb_send_tx_rejected(type_full, RaceLinkProto::TX_REJECT_ZEROLEN);
+    return false;
+  }
+  if (rl.txPending) {
+    usb_send_tx_rejected(type_full, RaceLinkProto::TX_REJECT_TXPENDING);
+    return false;
+  }
 
   const bool prevLbt = rl.lbtEnable;
   rl.lbtEnable = false;
   const bool ok = RaceLinkTransport::scheduleSend(rl, buf, len, 0 /*no jitter*/);
   rl.lbtEnable = prevLbt;
+  if (!ok) {
+    usb_send_tx_rejected(type_full, RaceLinkProto::TX_REJECT_UNKNOWN);
+  }
   return ok;
 }
 
 // Build + queue a global SYNC frame (broadcast) using the current millis()-based timebase.
-static bool sendSync(RaceLinkTransport::Core& rl, uint8_t brightness) {
+// ``flags`` is the SYNC_FLAG_* byte to pass through to nodes. Host-triggered
+// sync uses the host's flags (so SYNC_FLAG_TRIGGER_ARMED reaches the nodes
+// and materialises pending arm-on-sync state); autosync passes 0 so its
+// pulse is clock-tick only and cannot fire armed effects.
+//
+// Wire-format split: emit the legacy 4-byte body (no flags byte) when
+// flags == 0, 5-byte body when a flag is set. Old node firmware has
+// ``req_len = SZ<P_Sync>() = 4`` (strict) and rejects any body that
+// isn't exactly 4 bytes — so autosync MUST stay 4-byte to keep
+// pre-trigger-flag fleets in sync. New firmware has ``req_len = 0``
+// (variable) and accepts both 4 and 5 byte forms. RaceLinkProto::build
+// writes the struct linearly (Header7 + ts24_0..2 + brightness +
+// flags), so truncating by one byte cleanly drops only the trailing
+// ``flags`` field — same legacy bytes pre-update host emit.
+static bool sendSync(RaceLinkTransport::Core& rl, uint8_t brightness, uint8_t flags) {
   static const uint8_t BCAST3[3] = {0xFF, 0xFF, 0xFF};
 
   const uint32_t t = millis();
@@ -324,13 +616,20 @@ static bool sendSync(RaceLinkTransport::Core& rl, uint8_t brightness) {
   p.ts24_1 = (uint8_t)(t >> 8);
   p.ts24_2 = (uint8_t)(t >> 16);
   p.brightness = brightness;
+  p.flags = flags;
 
   uint8_t out[sizeof(RaceLinkProto::Header7) + sizeof(RaceLinkProto::P_Sync)];
   const uint8_t type_full = RaceLinkProto::make_type(RaceLinkProto::DIR_M2N, RaceLinkProto::OPC_SYNC);
-  const uint8_t n = RaceLinkProto::build(out, rl.myLast3, BCAST3, type_full, p);
+  uint8_t n = RaceLinkProto::build(out, rl.myLast3, BCAST3, type_full, p);
+  if (flags == 0) {
+    // Drop the trailing flags byte → 4-byte legacy body. Compatible
+    // with both old (req_len=4 strict) and new (req_len=0 variable)
+    // node firmware.
+    n -= 1;
+  }
 
-  // no CAD/LBT, no jitter
-  return rl_queueTxNoCad(rl, out, n);
+  // no CAD/LBT, no jitter; emits NACK on rejection for host-side correlation
+  return rl_queueTxNoCad(rl, out, n, type_full);
 }
 
 static bool transportInDefaultIdleState(const RaceLinkTransport::Core& rl) {
@@ -365,9 +664,11 @@ static void sync_service(RaceLinkTransport::Core& rl) {
   const uint32_t now = millis();
 
   // 1) Host-triggered SYNC retry: send ASAP once TX becomes available.
+  // Uses the captured hostSyncFlags so SYNC_FLAG_TRIGGER_ARMED still reaches
+  // nodes after a TX-busy retry.
   if (syncState == SyncState::HOST_SYNC_RETRY) {
     if (!rl.txPending) {
-      if (sendSync(rl, hostSyncBri)) {
+      if (sendSync(rl, hostSyncBri, hostSyncFlags)) {
         lastSyncQueuedMs = now;
         syncState = SyncState::AUTO_ALLOWED;
       }
@@ -375,16 +676,22 @@ static void sync_service(RaceLinkTransport::Core& rl) {
     return; // never auto-sync while host sync is pending
   }
 
-  // 2) After CONTROL(ARM): block auto-sync until host triggers one SYNC.
-  if (syncState == SyncState::WAIT_HOST_TRIGGER) {
-    return;
-  }
+  // 2) (disabled) After CONTROL(ARM): block auto-sync until host triggers one SYNC.
+  // Removed when SYNC_FLAG_TRIGGER_ARMED was introduced: nodes now only
+  // fire armed effects on a SYNC that carries the trigger flag, and
+  // autosync deliberately leaves it 0 — so this inhibit is no longer
+  // needed. The idle gate below is still load-bearing (don't autosync
+  // mid-TX or while USB work is queued); only the arm-aware gate goes.
+  // if (syncState == SyncState::WAIT_HOST_TRIGGER) {
+  //   return;
+  // }
 
-  // 3) Auto-SYNC: only when idle and at most every 30s.
+  // 3) Auto-SYNC: only when idle and at most every 30s. flags=0 = clock tick
+  // only, never fires armed effects.
   if (!idleForAutoSync(rl)) return;
   if (lastSyncQueuedMs != 0 && (uint32_t)(now - lastSyncQueuedMs) < 30000UL) return;
 
-  if (sendSync(rl, hostSyncBri)) {
+  if (sendSync(rl, hostSyncBri, /*flags=*/0)) {
     lastSyncQueuedMs = now;
   }
 }
@@ -398,11 +705,20 @@ void handleCommand() {
   const uint8_t firstByte = receivedBytes[1];
 
   // IDENTIFY (for port discovery)
-  if (payloadLen == 1 && firstByte == 1) {
+  if (payloadLen == 1 && firstByte == RaceLinkProto::GW_CMD_IDENTIFY) {
     char macstr[18];
     RaceLinkTransport::mac6ToStr(rl.myMac6, macstr);
     Serial.print(F(DEV_TYPE_STR));
     Serial.print(macstr);
+    newSerialData = false;
+    return;
+  }
+
+  // STATE_REQUEST: host asks for the current gateway state (Batch B). Replies
+  // with EV_STATE_REPORT(state_byte, [metadata]). Used at startup, after USB
+  // reconnect, and from the master-pill ↻ refresh button.
+  if (payloadLen == 1 && firstByte == RaceLinkProto::GW_CMD_STATE_REQUEST) {
+    emit_state_report();
     newSerialData = false;
     return;
   }
@@ -431,8 +747,8 @@ void handleCommand() {
           RaceLinkProto::P_GetDevices p{};
           memcpy(&p, body, sizeof(p));
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
-          RaceLinkTransport::scheduleSend(rl, out, n);
-          drawDebug(out, n);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
         }
       } break;
 
@@ -441,8 +757,8 @@ void handleCommand() {
           RaceLinkProto::P_SetGroup p{};
           memcpy(&p, body, sizeof(p));
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
-          RaceLinkTransport::scheduleSend(rl, out, n);
-          drawDebug(out, n);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
         }
       } break;
 
@@ -451,27 +767,32 @@ void handleCommand() {
           RaceLinkProto::P_GetStatus p{};
           memcpy(&p, body, sizeof(p));
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
-          RaceLinkTransport::scheduleSend(rl, out, n);
-          drawDebug(out, n);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
         }
       } break;
 
-      case RaceLinkProto::OPC_CONTROL: {
-        if (bodyLen == sizeof(RaceLinkProto::P_Control)) {
-          RaceLinkProto::P_Control p{};
+      case RaceLinkProto::OPC_PRESET: {
+        if (bodyLen == sizeof(RaceLinkProto::P_Preset)) {
+          RaceLinkProto::P_Preset p{};
           memcpy(&p, body, sizeof(p));
 
           // remember brightness for auto-sync (host may choose to ignore it on the nodes)
           hostSyncBri = p.brightness;
 
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
-          bool ok = RaceLinkTransport::scheduleSend(rl, out, n);
-          drawDebug(out, n);
+          bool ok = try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
 
-          // If this CONTROL arms a sync-start, block auto-sync until host triggers OPC_SYNC.
-          if (ok && (p.flags & GC_FLAG_ARM_ON_SYNC)) {
-            syncState = SyncState::WAIT_HOST_TRIGGER;
-          }
+          // (disabled) If this PRESET arms a sync-start, block auto-sync until host triggers OPC_SYNC.
+          // Removed when SYNC_FLAG_TRIGGER_ARMED was introduced — see the
+          // SyncState comment block. Kept commented out (rather than
+          // deleted) so the inhibit can be re-enabled without recreating
+          // it from scratch if a future protocol regression demands it.
+          // if (ok && (p.flags & GC_FLAG_ARM_ON_SYNC)) {
+          //   syncState = SyncState::WAIT_HOST_TRIGGER;
+          // }
+          (void)ok;
         }
       } break;
 
@@ -480,22 +801,24 @@ void handleCommand() {
           RaceLinkProto::P_Config p{};
           memcpy(&p, body, sizeof(p));
           n = RaceLinkProto::build(out, rl.myLast3, recv3, type_full, p);
-          RaceLinkTransport::scheduleSend(rl, out, n);
-          drawDebug(out, n);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
         }
       } break;
 
       case RaceLinkProto::OPC_SYNC: {
-        // Host triggers a global SYNC NOW (broadcast). Body is fixed-size P_Sync (brightness is used).
-        if (bodyLen == sizeof(RaceLinkProto::P_Sync)) {
-          RaceLinkProto::P_Sync p{};
-          memcpy(&p, body, sizeof(p));
-
+        // Host triggers a global SYNC NOW (broadcast). Body is variable: 4 B
+        // legacy clock-tick form, or 5 B with a trailing SYNC_FLAG_* byte.
+        // Bit 0 (SYNC_FLAG_TRIGGER_ARMED) gates pending arm-on-sync
+        // materialisation device-side; we capture and pass it through so the
+        // node sees the host's intent end-to-end.
+        if (bodyLen >= 4 && bodyLen <= sizeof(RaceLinkProto::P_Sync)) {
           // brightness to use for this (possibly retried) host-triggered sync
-          hostSyncBri = p.brightness;
+          hostSyncBri = body[3];
+          hostSyncFlags = (bodyLen >= 5) ? body[4] : 0;
 
           // Try to queue immediately (no CAD/LBT). If TX is busy, retry ASAP in sync_service().
-          if (sendSync(rl, hostSyncBri)) {
+          if (sendSync(rl, hostSyncBri, hostSyncFlags)) {
             lastSyncQueuedMs = millis();
             syncState = SyncState::AUTO_ALLOWED;   // host sync done -> auto sync allowed again (30s gate applies)
           } else {
@@ -509,8 +832,51 @@ void handleCommand() {
           const bool isBroadcast = RaceLinkTransport::isBroadcast3(recv3);
           const uint16_t rxWindowMs = isBroadcast ? RX_WINDOW_BROADCAST_MS : RX_WINDOW_UNICAST_MS;
           const int8_t rxNumWanted = isBroadcast ? -1 : 1;
-          RaceLinkTransport::scheduleStreamSend(rl, body, bodyLen, rl.myLast3, recv3, type_full,
-                                                rxWindowMs, rxNumWanted);
+          // scheduleStreamSend takes the streaming setup or refuses it because
+          // a stream is already active or the slot is busy. Per-chunk sends
+          // happen later in service() / queueNextStreamPacket. NACK only the
+          // setup-rejection here — the host's outcome registry lines up with
+          // the first chunk's EV_TX_DONE.
+          bool ok = RaceLinkTransport::scheduleStreamSend(rl, body, bodyLen, rl.myLast3, recv3, type_full,
+                                                          rxWindowMs, rxNumWanted);
+          if (!ok) {
+            uint8_t reason = rl.txPending ? RaceLinkProto::TX_REJECT_TXPENDING
+                                          : RaceLinkProto::TX_REJECT_UNKNOWN;
+            usb_send_tx_rejected(type_full, reason);
+          }
+        } else {
+          usb_send_tx_rejected(type_full, RaceLinkProto::TX_REJECT_ZEROLEN);
+        }
+      } break;
+
+      case RaceLinkProto::OPC_CONTROL: {
+        // Variable-length body (3..MAX_P_CONTROL=21 B). Layout: see P_Control in racelink_proto.h.
+        // build<T>() is not usable here (template needs fixed PayloadT); assemble header + raw body manually.
+        if (bodyLen >= 3 && bodyLen <= RaceLinkProto::MAX_P_CONTROL) {
+          RaceLinkProto::Header7* h = reinterpret_cast<RaceLinkProto::Header7*>(out);
+          RaceLinkProto::put3(h->sender, rl.myLast3);
+          RaceLinkProto::put3(h->receiver, recv3);
+          h->type = type_full;
+          memcpy(out + sizeof(RaceLinkProto::Header7), body, bodyLen);
+          n = (uint8_t)(sizeof(RaceLinkProto::Header7) + bodyLen);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
+        }
+      } break;
+
+      case RaceLinkProto::OPC_OFFSET: {
+        // Variable-length offset config (2..7 B body). First two bytes are
+        // groupId + mode; the rest depends on mode (see OffsetMode enum).
+        // Forwarded transparently; the gateway does not interpret the body.
+        if (bodyLen >= 2 && bodyLen <= RaceLinkProto::MAX_P_OFFSET) {
+          RaceLinkProto::Header7* h = reinterpret_cast<RaceLinkProto::Header7*>(out);
+          RaceLinkProto::put3(h->sender, rl.myLast3);
+          RaceLinkProto::put3(h->receiver, recv3);
+          h->type = type_full;
+          memcpy(out + sizeof(RaceLinkProto::Header7), body, bodyLen);
+          n = (uint8_t)(sizeof(RaceLinkProto::Header7) + bodyLen);
+          try_schedule_or_nack(rl, out, n, type_full);
+          requestDebugRedraw(out, n);
         }
       } break;
 
@@ -566,44 +932,96 @@ void transport_init() {
 
   //rl.radio = &radio; wird nun in der RaceLinkTransport::beginCommon gesetzt
 
-  // LBT aktivieren oder deaktivieren:
-  rl.lbtEnable = true;   // default: false
+  // LBT (Listen-Before-Talk) — adds a CAD scan + 50-300 ms backoff before
+  // every TX. Enabled (true) by default in the Core struct (used by WLED
+  // and other nodes); the gateway intentionally turns it OFF because it's
+  // the only host-side TX-er and doesn't need spectrum-sharing politeness
+  // with itself. Per-TX jitter for host commands is governed instead by
+  // try_schedule_or_nack (jitterMaxMs=0 since the Batch B follow-up,
+  // 2026-04-28); SYNC and stream chunks already pass jitterMaxMs=0
+  // explicitly via rl_queueTxNoCad / queueNextStreamPacket.
+  //
+  // GOTCHA for future maintainers: scheduleSend's LBT branch hard-overwrites
+  // `jitterMaxMs` to 300 ms (transport_core.h line 318) — that hidden cap
+  // is inside the LBT branch, not next to LBT's CAD-scan logic. So toggling
+  // lbtEnable here ALSO changes the effective jitter cap, not just CAD.
+  // This is the reason "enable LBT" used to look like a fix for the
+  // ~1 s host-command latency: the cap was masking the 50-2500 ms jitter
+  // default that try_schedule_or_nack used to inherit.
+  rl.lbtEnable = false;   // gateway-side default, distinct from the Core struct's default of true
   
   RaceLinkTransport::attachDio1(radio, rl);
   RaceLinkTransport::setDefaultRxContinuous(rl);
 }
 
 // --- benannte Callbacks (Master) ---
+// State machine emit policy (Batch B):
+//   * on_tx_start_cb  -> setGatewayState(TX). Pairs with EV_TX_DONE which the
+//                        host's _send_m2n waits on as the outcome event. The
+//                        STATE_CHANGED(TX) is for pill rendering only.
+//   * on_tx_done_cb   -> emits EV_TX_DONE (the outcome event). State stays TX
+//                        until the next on_rx_open_cb fires (which sets IDLE
+//                        under setDefaultRxContinuous, the gateway's mode).
+//   * on_rx_open_cb   -> ms == 0 means "entering continuous RX" = IDLE under
+//                        setDefaultRxContinuous (the gateway's resting state).
+//                        ms > 0 means a bounded RX_WINDOW; min_ms is metadata.
+//   * on_rx_closed_cb -> no state emit; the next on_rx_open_cb covers it.
+//                        (timed RX → continuous RX → IDLE happens within the
+//                        same service() loop pass.)
+//   * on_idle_cb      -> setGatewayState(IDLE). Only fires under
+//                        setDefaultRxNone, which the gateway doesn't currently
+//                        use. Wired up so a future mode switch needs no edit.
 static void on_tx_start_cb(void* ctx) {
-  // optional: eigenes Event, wenn du eins hast; sonst nur Anzeige
-  // usb_send_event_u8(EV_TX_START, 1);
-  drawStatus();                   // zeigt "TX" fett + erhöhten TX-Zähler (du erhöhst TX im Core)
+  setGatewayState(RaceLinkProto::GW_STATE_TX);
+  // Schedule a status redraw on Core 0; sub-µs cost in the RF hot path.
+  // Pre-offload this called drawStatus() directly which blocked ~7-10 ms
+  // on I²C — measurable overhead on multi-packet sends.
+  requestDisplayRedraw();
 }
 
 static void on_tx_done_cb(void* ctx) {
-  usb_send_event_u8(EV_TX_DONE, 1);
-  drawStatus();                   // zurück auf IDLE oder direkt später RX-Open → drawStatus() wird erneut aufgerufen
+  // EV_TX_DONE is the *outcome* event the host's _send_m2n waits on. The
+  // matching state transition (TX → IDLE under setDefaultRxContinuous, or
+  // TX → RX_WINDOW for unicast streams) is emitted by the next callback the
+  // service loop fires (on_rx_open_cb). Keeping outcome and state separate
+  // matches the v4 design: outcome and state are orthogonal events.
+  usb_send_event_u8(RaceLinkProto::EV_TX_DONE, 1);
+  // Status redraw scheduled — display task picks the latest rfMode value.
+  requestDisplayRedraw();
 }
 
 static void on_rx_open_cb(uint16_t ms, void* ctx) {
-  usb_send_event_u16(EV_RX_WINDOW_OPEN, ms);
-  drawStatus();                   // RX fett + RX-Window-Time sichtbar
+  if (ms > 0) {
+    setGatewayState(RaceLinkProto::GW_STATE_RX_WINDOW, ms, /*has_meta=*/true);
+  } else {
+    // Continuous RX = the gateway's resting state under setDefaultRxContinuous
+    setGatewayState(RaceLinkProto::GW_STATE_IDLE);
+  }
+  requestDisplayRedraw();
 }
 
 static void on_rx_packet_cb(const uint8_t* pkt, uint8_t len, int16_t rssi, int8_t snr, void* ctx) {
   usb_forward_transport(pkt, len, rssi, snr);
-  drawStatus();                   // RX-Zähler inkrementiert + Anzeige
-  drawDebug(pkt, len);
+  // Snapshot the bytes into the shared dispbuffer + signal the task.
+  // RX-counter changes are visible too — schedule a status redraw.
+  requestDisplayRedraw();
+  requestDebugRedraw(pkt, len);
 }
 
 static void on_rx_closed_cb(uint16_t delta, void* ctx) {
-  usb_send_event_u16(EV_RX_WINDOW_CLOSED, delta);
-  drawStatus();                   // zurück auf IDLE fett
+  // No state emit — the subsequent on_rx_open_cb in the same service pass
+  // sets the new state (continuous RX = IDLE, or another RX_WINDOW for a
+  // chained operation). The delta byte is no longer surfaced; per-window
+  // RX counts are visible via the per-packet forwarding path.
+  requestDisplayRedraw();
 }
 
 static void on_idle_cb(void* ctx) {
-  //usb_send_event_u8(EV_IDLE, 1);
-  drawStatus();                   // zurück auf IDLE
+  // Reachable only under setDefaultRxNone (not the current gateway mode). The
+  // setGatewayState() dedup guards make this a no-op when the state is already
+  // IDLE.
+  setGatewayState(RaceLinkProto::GW_STATE_IDLE);
+  requestDisplayRedraw();
 }
 
 /************ Setup/Loop ************/
@@ -655,13 +1073,42 @@ void setup() {
   cb.onIdle          = on_idle_cb;
   cb.ctx             = nullptr;       // oder &deinContext
 
-  // Startanzeige
+  // Startanzeige — runs on Core 1 BEFORE the display task is created,
+  // so direct u8g2 calls are safe here (no other task touches u8g2 yet).
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tf);
   u8g2.drawStr(0, 12, "RaceLink Init...");
   u8g2.sendBuffer();
   delay(150);
-  drawStatus();
+  drawStatusInternal();
+
+  // Seed the gateway state machine. Under setDefaultRxContinuous (the gateway's
+  // mode) the resting state is IDLE = "in continuous RX, ready". This emits the
+  // first EV_STATE_CHANGED(IDLE) so a host that connects after boot sees a
+  // valid pill state without waiting for the next service() pass. A host that
+  // missed this initial event re-syncs via GW_CMD_STATE_REQUEST anyway.
+  setGatewayState(RaceLinkProto::GW_STATE_IDLE);
+
+  // Hand display ownership to a Core-0 FreeRTOS task. After this point the
+  // Arduino loop on Core 1 must NEVER touch u8g2.* or Wire.* directly —
+  // only through requestDisplayRedraw() / requestDebugRedraw(), which
+  // signal the task via xTaskNotifyGive (sub-µs, no I²C blocking on the
+  // RF/USB hot path).
+  //
+  // Stack: 4 KB is generous for u8g2's draw buffers + snprintf locals.
+  // Priority: tskIDLE_PRIORITY + 1 — low; cooperates with the FreeRTOS
+  // idle task on Core 0.
+  // Pinned to Core 0 (PRO_CPU): WiFi/BLE are not enabled in this firmware
+  // so Core 0 is otherwise idle.
+  xTaskCreatePinnedToCore(
+    displayTaskFn,           // task function
+    "rl-display",            // name (visible in `vTaskList` debug output)
+    4096,                    // stack bytes
+    nullptr,                 // params
+    tskIDLE_PRIORITY + 1,    // priority (low)
+    &g_displayTask,          // handle (used by request* helpers)
+    0                        // pin to Core 0 (PRO_CPU)
+  );
 }
 
 void loop() {
@@ -691,7 +1138,9 @@ void loop() {
       showDebug = !showDebug;
       if (!showDebug) {
         inhibitStatusDraw = false;
-        drawStatus();
+        // Schedule a redraw; the display task on Core 0 picks the latest
+        // showDebug + inhibitStatusDraw values when it renders.
+        requestDisplayRedraw();
       }
     }
     // Release → Short, falls kein Long
@@ -699,7 +1148,7 @@ void loop() {
       if (!longHandled && (now - pressStartMs) >= 30) {
         // LONG: CONTROL an lastRespondent
         inhibitStatusDraw = false;
-        drawStatus();
+        requestDisplayRedraw();
       }
       pressStartMs = 0;
       longHandled  = false;

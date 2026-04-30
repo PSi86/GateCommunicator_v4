@@ -275,6 +275,35 @@ inline void cancelRxRequest(Core& rl) {
 // with LBT enabled jitterMaxMs is overridden with 300ms -> do it based on ToA?!
 // without LBT and jitterMaxMs>50 the given jitterMaxMs is used to delay the TX
 // without LBT and jitterMaxMs=0 the TX is scheduled immediately
+//
+// =============================================================================
+// NACK event shipped (Batch B, 2026-04-28); no-queue still pending
+// =============================================================================
+// The single-slot ``txPending`` check below still rejects any frame that
+// arrives while a previous TX is still in flight. As of Batch B the gateway
+// firmware now wraps every host-initiated ``scheduleSend`` call in
+// ``try_schedule_or_nack(...)`` (see RaceLink_Gateway/src/main.cpp), which
+// emits ``EV_TX_REJECTED(type_full, reason)`` to the USB host on rejection.
+// The host's synchronous ``_send_m2n`` consumes this NACK as the call's
+// outcome — silent loss is eliminated.
+//
+// Reason codes (racelink_proto.h "TX_REJECT_*"):
+//   TX_REJECT_TXPENDING (0x01)  the slot is busy on a prior frame
+//   TX_REJECT_OVERSIZE  (0x02)  body exceeded sizeof(rl.txBuf)
+//   TX_REJECT_ZEROLEN   (0x03)  body length 0 (host-side framing bug)
+//   TX_REJECT_UNKNOWN   (0xFF)  defence-in-depth fallback
+//
+// Open future work (still useful, not blocking):
+//   * Buffered burst tolerance: a small TX queue (e.g. 4 entries) inside
+//     ``scheduleSend`` would let the gateway absorb bursts during the LBT
+//     50-300 ms backoff window without surfacing TX_REJECTED to the host.
+//     Trade-off: introduces ordering vs. fairness questions and a small
+//     in-memory cost; keep deferred until a workload actually needs it.
+//
+// See docs/PROTOCOL.md "Host ↔ Gateway flow control" for the host-side
+// documentation of the synchronous-send contract that this NACK now
+// underwrites.
+// =============================================================================
 inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500) {
 
   if (rl.txPending || len == 0 || len > sizeof(rl.txBuf)) return false; // Check for pending TX or oversize

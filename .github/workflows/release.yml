@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       RELEASE_ENV: WirelessStickV3-ESP32S3
 
     steps:
@@ -147,7 +148,7 @@ jobs:
           git push origin "HEAD:${{ inputs.target_branch }}" --follow-tags
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: racelink_gateway_release
           path: |
@@ -155,7 +156,7 @@ jobs:
             dist/${{ steps.stage_artifacts.outputs.checksum_name }}
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release_version.outputs.tag }}
           target_commitish: ${{ inputs.target_branch }}
